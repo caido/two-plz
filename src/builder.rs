@@ -301,6 +301,13 @@ where
         self
     }
 
+    /// Starts an HTTP/2 connection.
+    ///
+    /// For clients, this returns after the connection preface and initial
+    /// `SETTINGS` frame have been flushed. The returned connection future
+    /// receives and validates the peer's initial `SETTINGS`, so requests may be
+    /// queued before the peer preface arrives. Servers complete the full peer
+    /// preface exchange before this returns.
     pub async fn handshake<T>(
         mut self,
         io: T,

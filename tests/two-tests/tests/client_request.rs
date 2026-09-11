@@ -1,5 +1,4 @@
-use crate::preface::PrefaceError;
-use support::prelude::{proto::ProtoError, *};
+use support::prelude::*;
 
 // skipped
 // send_reset_notifies_recv_stream
@@ -34,6 +33,152 @@ async fn client_handshake() {
         .await
         .unwrap();
     conn.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_sends_request_before_peer_settings() {
+    support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv_fut = async move {
+        srv.read_preface().await.unwrap();
+
+        let settings = assert_settings!(srv.recv_frame_raw().await);
+        assert_default_settings!(settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https", "http2.akamai.com", "/")
+                .eos(),
+        )
+        .await;
+
+        srv.send_frame(frame::Settings::default())
+            .await;
+        srv.send_frame(frame::Settings::ack())
+            .await;
+        srv.recv_frame(frame::Settings::ack())
+            .await;
+        srv.send_frame(frames::headers(1).response(200).eos())
+            .await;
+    };
+
+    let client_fut = async move {
+        let (mut conn, mut client) = ClientBuilder::new()
+            .handshake(io)
+            .await
+            .expect("write-ready handshake");
+        let response = client
+            .send_request(build_test_request())
+            .unwrap();
+        let response = conn.drive(response).await.unwrap();
+        assert_eq!(response.status(), &StatusCode::OK);
+    };
+
+    join(srv_fut, client_fut).await;
+}
+
+#[tokio::test]
+async fn client_rejects_settings_ack_as_first_peer_frame() {
+    support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv_fut = async move {
+        srv.read_preface().await.unwrap();
+        let settings = assert_settings!(srv.recv_frame_raw().await);
+        assert_default_settings!(settings);
+        srv.send_frame(frame::Settings::ack())
+            .await;
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https", "http2.akamai.com", "/")
+                .eos(),
+        )
+        .await;
+        srv.recv_frame(frames::go_away(0).protocol_error())
+            .await;
+    };
+
+    let client_fut = async move {
+        let (mut conn, mut client) = ClientBuilder::new()
+            .handshake(io)
+            .await
+            .expect("write-ready handshake");
+        let response = client
+            .send_request(build_test_request())
+            .expect("queue request");
+        let partial = conn
+            .drive(response)
+            .await
+            .expect_err("initial SETTINGS ACK must fail queued requests");
+        assert_eq!(partial.err().reason(), Some(Reason::PROTOCOL_ERROR));
+    };
+
+    join(srv_fut, client_fut).await;
+}
+
+#[tokio::test]
+async fn client_rejects_non_settings_first_peer_frame() {
+    support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv_fut = async move {
+        srv.read_preface().await.unwrap();
+        let settings = assert_settings!(srv.recv_frame_raw().await);
+        assert_default_settings!(settings);
+        srv.send_frame(frames::ping([0; 8]))
+            .await;
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https", "http2.akamai.com", "/")
+                .eos(),
+        )
+        .await;
+        srv.recv_frame(frames::go_away(0).protocol_error())
+            .await;
+    };
+
+    let client_fut = async move {
+        let (mut conn, mut client) = ClientBuilder::new()
+            .handshake(io)
+            .await
+            .expect("write-ready handshake");
+        let response = client
+            .send_request(build_test_request())
+            .expect("queue request");
+        let partial = conn
+            .drive(response)
+            .await
+            .expect_err("initial PING must fail queued requests");
+        assert_eq!(partial.err().reason(), Some(Reason::PROTOCOL_ERROR));
+    };
+
+    join(srv_fut, client_fut).await;
+}
+
+#[tokio::test]
+async fn client_rejects_eof_before_peer_settings() {
+    support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv_fut = async move {
+        srv.read_preface().await.unwrap();
+        let settings = assert_settings!(srv.recv_frame_raw().await);
+        assert_default_settings!(settings);
+    };
+
+    let client_fut = async move {
+        let (conn, _client) = ClientBuilder::new()
+            .handshake(io)
+            .await
+            .expect("write-ready handshake");
+        let err = conn
+            .await
+            .expect_err("EOF before initial peer SETTINGS must fail");
+        assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+    };
+
+    join(srv_fut, client_fut).await;
 }
 
 #[tokio::test]
@@ -565,6 +710,8 @@ async fn request_with_connection_headers() {
     let (io, mut srv) = mock::new();
 
     let srv_fut = async move {
+        srv.send_frame(frames::new_settings())
+            .await;
         srv.read_preface().await.unwrap();
         srv.recv_frame(frames::new_settings())
             .await;
@@ -587,7 +734,7 @@ async fn request_with_connection_headers() {
     ];
 
     let client_fut = async move {
-        let (conn, mut client) = ClientBuilder::new()
+        let (mut conn, mut client) = ClientBuilder::new()
             .handshake(io)
             .await
             .expect("handshake");
@@ -614,6 +761,7 @@ async fn request_with_connection_headers() {
             assert_eq!(err.to_string(), "user error: malformed headers");
         }
 
+        poll_once(&mut conn).await.unwrap();
         drop(client);
         conn.await.unwrap();
     };
@@ -1494,10 +1642,11 @@ async fn extended_connect_protocol_disabled_by_default() {
     };
 
     let client_fut = async move {
-        let (conn, _) = ClientBuilder::new()
+        let (mut conn, _client) = ClientBuilder::new()
             .handshake(io)
             .await
             .expect("handshake");
+        poll_once(&mut conn).await.unwrap();
         assert!(!conn.is_extended_connect_protocol_enabled());
     };
 
@@ -1519,10 +1668,12 @@ async fn handshake_apply_enable_connect_protocol_settings() {
     };
 
     let client_fut = async move {
-        let (conn, _) = ClientBuilder::new()
+        let (mut conn, _client) = ClientBuilder::new()
             .handshake(io)
             .await
             .expect("handshake");
+        assert!(!conn.is_extended_connect_protocol_enabled());
+        poll_once(&mut conn).await.unwrap();
         assert!(conn.is_extended_connect_protocol_enabled());
     };
 
@@ -1563,13 +1714,14 @@ async fn invalid_connect_protocol_enabled_setting() {
     };
 
     let client_fut = async move {
-        if let Err(PrefaceError::Proto {
-            context: _,
-            source: ProtoError::GoAway(_, reason, _),
-        }) = ClientBuilder::new().handshake(io).await
-        {
-            assert_eq!(reason, Reason::PROTOCOL_ERROR);
-        }
+        let (conn, _client) = ClientBuilder::new()
+            .handshake(io)
+            .await
+            .expect("write-ready handshake");
+        let err = conn
+            .await
+            .expect_err("invalid peer settings must fail");
+        assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
     };
 
     join(srv, client_fut).await;
@@ -1794,11 +1946,13 @@ async fn configured_max_concurrent_send_streams_and_update_it_based_on_non_empty
     };
 
     let client_fut = async move {
-        let (conn, _client) = ClientBuilder::new()
+        let (mut conn, _client) = ClientBuilder::new()
             .handshake(io)
             .await
             .unwrap();
 
+        assert_eq!(conn.max_concurrent_send_streams(), usize::MAX);
+        poll_once(&mut conn).await.unwrap();
         assert_eq!(conn.max_concurrent_send_streams(), 42);
     };
 
@@ -1848,6 +2002,8 @@ async fn receive_settings_frame_twice_with_second_one_empty() {
             .await
             .unwrap();
 
+        let mut conn = std::pin::pin!(conn);
+        conn.as_mut().await.unwrap();
         assert_eq!(conn.max_concurrent_send_streams(), 42);
     };
 

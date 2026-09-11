@@ -184,10 +184,9 @@ impl Counts {
 
     // ===== SETTINGS =====
     pub fn apply_remote_settings(&mut self, settings: &frame::Settings) {
-        self.max_send_streams = settings
-            .max_concurrent_streams()
-            .map(|v| v as usize)
-            .unwrap_or(usize::MAX)
+        if let Some(max) = settings.max_concurrent_streams() {
+            self.max_send_streams = max as usize;
+        }
     }
 
     // ===== Misc =====
