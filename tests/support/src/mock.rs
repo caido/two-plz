@@ -120,6 +120,7 @@ impl Drop for Mock {
 #[derive(Debug)]
 pub struct Handle {
     codec: crate::Codec<Pipe>,
+    pending_frame: Option<Frame>,
 }
 
 impl Stream for Handle {
@@ -129,6 +130,9 @@ impl Stream for Handle {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        if let Some(frame) = self.pending_frame.take() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
         Pin::new(&mut self.codec).poll_next(cx)
     }
 }
@@ -315,8 +319,19 @@ impl Handle {
             }
         };
 
-        // read ack
+        // Enhanced mode can send its initial PING before the SETTINGS ACK.
+        // Preserve it so the caller still verifies and acknowledges the PING.
         let frame = self.next().await.unwrap().unwrap();
+        let frame = if let Frame::Ping(_) = frame {
+            self.pending_frame = Some(frame);
+            self.codec
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            frame
+        };
         let f = assert_settings!(frame);
         assert!(f.is_ack());
 
@@ -546,6 +561,7 @@ pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
         codec: two_plz::Codec::new(Pipe {
             inner,
         }),
+        pending_frame: None,
     };
 
     (mock, handle)
