@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 jobs:
   conformance:
@@ -24,10 +25,18 @@ jobs:
       - name: Run HTTP/2 conformance tests
         run: mise run test:conformance
 
-      - name: Upload h2spec report
-        if: ${{ !cancelled() && hashFiles('artifacts/h2spec.junit.xml') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: h2spec-junit-report
-          path: artifacts/h2spec.junit.xml
-          if-no-files-found: error
+      - name: Comment h2spec results on the pull request
+        if: >-
+          ${{ !cancelled()
+            && github.event_name == 'pull_request'
+            && github.event.pull_request.head.repo.full_name == github.repository
+            && github.actor != 'dependabot[bot]'
+            && hashFiles('artifacts/h2spec.junit.xml') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 ci/h2spec_comment.py artifacts/h2spec.junit.xml "$RUN_URL" > artifacts/h2spec-comment.md
+          gh pr comment "$PR_NUMBER" --body-file artifacts/h2spec-comment.md
