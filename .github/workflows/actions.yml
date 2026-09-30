@@ -1,0 +1,36 @@
+name: GitHub Actions validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actions:
+    name: Validate and audit workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install mise
+        uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
+        with:
+          cache: true
+
+      - name: Validate workflows
+        run: wrkflw validate --exit-code .github/workflows
+
+      - name: Audit GitHub Actions
+        run: zizmor --offline --strict-collection --format=github --no-exit-codes .
+
+      - name: Enforce pinned GitHub Actions
+        run: |
+          zizmor --offline --strict-collection --format=json-v1 --no-exit-codes . \
+            | jq --exit-status 'all(.ident != "unpinned-uses")'

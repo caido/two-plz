@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use ca::*;
 use error::*;
-use openssl::hash::DigestBytes;
 use rcgen::{CertificateParams, KeyPair};
 use rustls::KeyLogFile;
 use rustls_pki_types::PrivateKeyDer;
@@ -91,7 +90,7 @@ impl CaptainCrypto {
     pub fn check_serial(
         &self,
         verified: bool,
-        digest_to_check: DigestBytes,
+        digest_to_check: &[u8],
     ) -> Option<Arc<ServerConfig>> {
         let cert_store = if verified {
             trace!("trusted");
@@ -103,7 +102,7 @@ impl CaptainCrypto {
         cert_store
             .iter()
             .find_map(|(digest, config)| {
-                if digest.as_ref() == digest_to_check.as_ref() {
+                if digest.as_slice() == digest_to_check {
                     Some(config.clone())
                 } else {
                     None

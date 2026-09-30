@@ -1,7 +1,6 @@
 use std::fs::read_to_string;
 use std::sync::Arc;
 
-use openssl::hash::DigestBytes;
 use rcgen::{Certificate, CertificateParams, KeyPair};
 use tokio_rustls::rustls::ServerConfig;
 
@@ -17,12 +16,11 @@ use super::CryptoBuildError;
  *
  * TODO:
  *      Use HashMap instead of Vec
- *      https://github.com/sfackler/rust-openssl/pull/2299
  */
 
 pub struct CA {
     cert: Certificate,
-    store: Vec<(DigestBytes, Arc<ServerConfig>)>,
+    store: Vec<(Vec<u8>, Arc<ServerConfig>)>,
 }
 
 impl CA {
@@ -52,15 +50,11 @@ impl CA {
         &self.cert
     }
 
-    pub fn store(&self) -> &Vec<(DigestBytes, Arc<ServerConfig>)> {
+    pub fn store(&self) -> &[(Vec<u8>, Arc<ServerConfig>)] {
         &self.store
     }
 
-    pub fn add_config(
-        &mut self,
-        digest: DigestBytes,
-        config: Arc<ServerConfig>,
-    ) {
+    pub fn add_config(&mut self, digest: Vec<u8>, config: Arc<ServerConfig>) {
         self.store.push((digest, config));
     }
 }

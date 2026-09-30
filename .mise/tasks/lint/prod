@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#MISE description="Check Rust formatting and run Clippy"
+
+set -euo pipefail
+
+echo "Checking Rust formatting..."
+cargo fmt --all -- --check
+
+echo "Running Clippy..."
+cargo clippy --workspace --all-targets --all-features -- -D warnings
