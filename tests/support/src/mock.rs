@@ -287,12 +287,13 @@ impl Handle {
         T: Into<frame::Settings>,
     {
         let settings = settings.into();
-        // read preface
-        self.read_preface().await.unwrap();
-        // Send a settings frame
+        // Servers send their connection preface independently of the client
+        // preface, so make it available before waiting for the client bytes.
         self.send(settings.into())
             .await
             .unwrap();
+        // read preface
+        self.read_preface().await.unwrap();
 
         // read settings
         let settings = match self.next().await {

@@ -106,8 +106,9 @@ where
     ///
     /// This limit is configured by the server peer by sending the
     /// [`SETTINGS_MAX_CONCURRENT_STREAMS` parameter][1] in a `SETTINGS` frame.
-    /// This method returns the currently acknowledged value received from the
-    /// remote.
+    /// This method returns the most recently received value. Before the peer's
+    /// initial `SETTINGS` frame arrives, it returns the protocol default of no
+    /// advertised limit.
     ///
     /// [1]: https://tools.ietf.org/html/rfc7540#section-5.1.2
     pub fn max_concurrent_send_streams(&self) -> usize {

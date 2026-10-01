@@ -22,9 +22,9 @@ pub use error::*;
 client state
     1. Send Preface (24 bytes)
     2. Send SETTINGS
-    3. Read first frame → MUST be server SETTINGS
-    4. Send SETTINGS ACK
-    5. Start sending/receiving requests
+    3. Start sending requests
+    4. Read first peer frame → MUST be server SETTINGS
+    5. Send SETTINGS ACK
 
 server state
     1. Send SETTINGS
@@ -67,29 +67,16 @@ where
 
         // 2. Send local SETTINGS
         codec
-            .buffer(local_settings.clone().into())
+            .buffer(local_settings.into())
             .ctx("buffer local settings")?;
 
         Self::flush(&mut codec)
             .await
             .ctx("flush local settings")?;
 
-        // 3. Read peer SETTINGS
-        let remote_settings = Self::read_peer_settings(&mut codec).await?;
-
-        // 4. Apply peer settings
-        Self::apply_peer_settings(&mut codec, &remote_settings);
-
-        // 5. Send SETTINGS ACK
-        codec
-            .buffer(Settings::ack().into())
-            .ctx("buffer settings ack")?;
-
-        Self::flush(&mut codec)
-            .await
-            .ctx("flush settings ack")?;
-
-        Ok((codec, remote_settings))
+        // The connection is now write-ready. The connection driver receives,
+        // validates, applies, and acknowledges the peer's initial SETTINGS.
+        Ok((codec, Settings::default()))
     }
 
     async fn server_handshake(

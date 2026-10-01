@@ -39,10 +39,17 @@ enum ConnectionState {
     Closed(Reason, Initiator),
 }
 
+#[derive(Debug)]
+enum PeerPrefaceState {
+    AwaitingSettings,
+    ReceivedSettings,
+}
+
 pub struct Connection<T> {
     codec: Codec<T, Bytes>,
     pub(crate) streams: Streams<Bytes>,
     settings_handler: SettingsHandler,
+    peer_preface_state: PeerPrefaceState,
     ping_handler: PingHandler,
     goaway_handler: GoAway,
     role: Role,
@@ -53,6 +60,7 @@ pub struct Connection<T> {
     /// This exists separately from State in order to support
     /// graceful shutdown.
     error: Option<frame::GoAway>,
+    local_error: Option<ProtoError>,
     is_spa: bool,
 }
 
@@ -77,9 +85,16 @@ where
             spa_tracker.add_enhanced_ping_first_ping(&mut ping_handler);
         }
 
+        let peer_preface_state = if role.is_client() {
+            PeerPrefaceState::AwaitingSettings
+        } else {
+            PeerPrefaceState::ReceivedSettings
+        };
+
         Connection {
             state: ConnectionState::Open,
             settings_handler,
+            peer_preface_state,
             ping_handler,
             goaway_handler: GoAway::new(),
             codec,
@@ -88,6 +103,7 @@ where
             is_spa,
             streams: Streams::new(role.clone(), config),
             error: None,
+            local_error: None,
         }
     }
 
@@ -129,6 +145,23 @@ where
         frame: Frame,
         cx: &mut Context,
     ) -> Result<(), ProtoError> {
+        if matches!(
+            self.peer_preface_state,
+            PeerPrefaceState::AwaitingSettings
+        ) {
+            match &frame {
+                Frame::Settings(settings) if !settings.is_ack() => {
+                    self.peer_preface_state =
+                        PeerPrefaceState::ReceivedSettings;
+                }
+                _ => {
+                    return Err(ProtoError::library_go_away(
+                        Reason::PROTOCOL_ERROR,
+                    ));
+                }
+            }
+        }
+
         match frame {
             Frame::Data(data) => self.streams.recv_data(data),
             Frame::Headers(headers) => self.streams.recv_header(headers),
@@ -346,6 +379,14 @@ where
                 }
                 None => {
                     trace!("codec closed");
+                    if matches!(
+                        self.peer_preface_state,
+                        PeerPrefaceState::AwaitingSettings
+                    ) {
+                        return Poll::Ready(Err(ProtoError::library_go_away(
+                            Reason::PROTOCOL_ERROR,
+                        )));
+                    }
                     self.streams
                         .recv_eof(false)
                         .expect("mutex poisoned");
@@ -462,8 +503,11 @@ where
             return;
         }
 
-        // Reset and Notify all active streams
-        self.streams.handle_error(e);
+        // Reset and notify all active streams, and retain the error for the
+        // connection future. Deferred peer-preface failures no longer surface
+        // from Builder::handshake.
+        self.streams.handle_error(e.clone());
+        self.local_error = Some(e);
         self.go_away_now_data(reason, debug_data);
     }
 
@@ -501,6 +545,10 @@ where
         ours: Reason,
         initiator: Initiator,
     ) -> Result<(), ProtoError> {
+        if let Some(error) = self.local_error.take() {
+            return Err(error);
+        }
+
         let (debug_data, theirs) = self
             .error
             .take()
