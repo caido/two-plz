@@ -1,0 +1,33 @@
+name: HTTP/2 conformance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: Server conformance and client protocol tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+
+      - name: Run HTTP/2 conformance tests
+        run: mise run test:conformance
+
+      - name: Upload h2spec report
+        if: ${{ !cancelled() && hashFiles('artifacts/h2spec.junit.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2spec-junit-report
+          path: artifacts/h2spec.junit.xml
+          if-no-files-found: error

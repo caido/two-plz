@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#MISE description="Run the HTTP/2 client protocol integration suite"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**/*.rs", "tests/**/*.rs"]
+#MISE outputs={ auto = true }
+
+set -euo pipefail
+cargo test -p two-tests --test client_request

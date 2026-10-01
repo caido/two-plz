@@ -4,4 +4,5 @@
 **/.vscode/
 **/mock_server/
 Cargo.lock
+artifacts/
 .DS_Store
