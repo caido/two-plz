@@ -418,6 +418,11 @@ impl Send {
     fn try_assign_capacity(&mut self, stream: &mut Ptr) {
         let span = trace_span!("try assign capacity| ", ?stream.id);
         let _ = span.enter();
+        // Window updates can arrive before a locally initiated stream opens.
+        // Opening schedules its headers; data capacity is allocated after that.
+        if stream.is_pending_open {
+            return;
+        }
         let stream_available = stream.send_flow.available();
         trace!("stream flow| {stream_available}");
 
