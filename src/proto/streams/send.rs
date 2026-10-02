@@ -801,107 +801,100 @@ impl Send {
         counts: &mut Counts,
     ) -> Option<Frame<Bytes>> {
         loop {
-            match self.pending_send.pop(store) {
-                Some(mut stream) => {
-                    let span = trace_span!("pop frame| ", ?stream.id);
-                    let _ = span.enter();
-                    // It's possible that this stream, besides having data to
-                    // send, is also queued to send a reset, and thus is
-                    // already in the queue to wait for "some time" after a
-                    // reset.
-                    //
-                    // To be safe, we just always ask the stream.
-                    let is_pending_reset =
-                        stream.is_pending_reset_expiration();
+            let mut stream = self.pending_send.pop(store)?;
+            {
+                let span = trace_span!("pop frame| ", ?stream.id);
+                let _ = span.enter();
+                // It's possible that this stream, besides having data to
+                // send, is also queued to send a reset, and thus is
+                // already in the queue to wait for "some time" after a
+                // reset.
+                //
+                // To be safe, we just always ask the stream.
+                let is_pending_reset = stream.is_pending_reset_expiration();
 
-                    // local reference dropped
-                    if stream.state.is_remote_reset()
-                        || Some(Reason::CANCEL)
-                            == stream.state.get_scheduled_reset()
-                    {
-                        trace!("reset| {}", stream.state.is_remote_reset());
-                        self.clear_stream_queue(buffer, &mut stream);
-                    }
-
-                    let frame = match stream.pending_send.pop_front(buffer) {
-                        Some(Frame::Data(frame)) => {
-                            if let Some(frame) = self.pop_data_frame(
-                                buffer,
-                                &mut stream,
-                                max_frame_size,
-                                frame,
-                            ) {
-                                frame
-                            } else {
-                                continue;
-                            }
-                        }
-                        Some(Frame::Headers(header)) => {
-                            // if data frame is present, try assign capacity
-                            if stream.remaining_data_len.is_some() {
-                                trace!(
-                                    "popping header| remaining data| {}",
-                                    stream.remaining_data_len.unwrap()
-                                );
-                                self.try_assign_capacity(&mut stream);
-                            }
-                            if stream.is_sending_trailer {
-                                stream.state.send_close();
-                            }
-                            Frame::Headers(header)
-                        }
-                        Some(frame) => frame.map(|_| {
-                            unreachable!(
-                                "Frame::map closure will only be called \
-                                 on DATA frames."
-                            )
-                        }),
-                        None => {
-                            if let Some(reason) =
-                                stream.state.get_scheduled_reset()
-                            {
-                                stream.set_reset(reason, Initiator::Library);
-                                let frame =
-                                    frame::Reset::new(stream.id, reason);
-                                Frame::Reset(frame)
-                            } else {
-                                // If the stream receives a RESET from the
-                                // peer, it may have had data buffered to be
-                                // sent, but all the frames are cleared in
-                                // clear_queue(). Instead of doing O(N)
-                                // traversal through queue to remove, lets just
-                                // ignore the stream here.
-                                debug_assert!(stream.state.is_closed());
-                                counts.transition_after(
-                                    stream,
-                                    is_pending_reset,
-                                );
-                                continue;
-                            }
-                        }
-                    };
-                    if stream.state.is_idle() {
-                        self.last_opened_id = stream.id;
-                    }
-                    // spa check
-                    if let Some(spa) = self.spa_tracker.as_mut()
-                        && stream.remaining_data_len == Some(1)
-                    {
-                        debug_assert!(!stream.pending_send.is_empty());
-                        spa.add_pending_spa(stream.id);
-                    } else if !stream.pending_send.is_empty()
-                        || stream.state.is_scheduled_reset()
-                    {
-                        // TODO(hyper): Only requeue the sender if it is ready
-                        // to send the next frame. i.e. don't requeue it if the
-                        // next frame is a data frame and the stream does not
-                        // have any more capacity.
-                        self.pending_send.push(&mut stream);
-                    }
-                    counts.transition_after(stream, is_pending_reset);
-                    return Some(frame);
+                // local reference dropped
+                if stream.state.is_remote_reset()
+                    || Some(Reason::CANCEL)
+                        == stream.state.get_scheduled_reset()
+                {
+                    trace!("reset| {}", stream.state.is_remote_reset());
+                    self.clear_stream_queue(buffer, &mut stream);
                 }
-                None => return None,
+
+                let frame = match stream.pending_send.pop_front(buffer) {
+                    Some(Frame::Data(frame)) => {
+                        if let Some(frame) = self.pop_data_frame(
+                            buffer,
+                            &mut stream,
+                            max_frame_size,
+                            frame,
+                        ) {
+                            frame
+                        } else {
+                            continue;
+                        }
+                    }
+                    Some(Frame::Headers(header)) => {
+                        // if data frame is present, try assign capacity
+                        if stream.remaining_data_len.is_some() {
+                            trace!(
+                                "popping header| remaining data| {}",
+                                stream.remaining_data_len.unwrap()
+                            );
+                            self.try_assign_capacity(&mut stream);
+                        }
+                        if stream.is_sending_trailer {
+                            stream.state.send_close();
+                        }
+                        Frame::Headers(header)
+                    }
+                    Some(frame) => frame.map(|_| {
+                        unreachable!(
+                            "Frame::map closure will only be called \
+                                 on DATA frames."
+                        )
+                    }),
+                    None => {
+                        if let Some(reason) =
+                            stream.state.get_scheduled_reset()
+                        {
+                            stream.set_reset(reason, Initiator::Library);
+                            let frame = frame::Reset::new(stream.id, reason);
+                            Frame::Reset(frame)
+                        } else {
+                            // If the stream receives a RESET from the
+                            // peer, it may have had data buffered to be
+                            // sent, but all the frames are cleared in
+                            // clear_queue(). Instead of doing O(N)
+                            // traversal through queue to remove, lets just
+                            // ignore the stream here.
+                            debug_assert!(stream.state.is_closed());
+                            counts.transition_after(stream, is_pending_reset);
+                            continue;
+                        }
+                    }
+                };
+                if stream.state.is_idle() {
+                    self.last_opened_id = stream.id;
+                }
+                // spa check
+                if let Some(spa) = self.spa_tracker.as_mut()
+                    && stream.remaining_data_len == Some(1)
+                {
+                    debug_assert!(!stream.pending_send.is_empty());
+                    spa.add_pending_spa(stream.id);
+                } else if !stream.pending_send.is_empty()
+                    || stream.state.is_scheduled_reset()
+                {
+                    // TODO(hyper): Only requeue the sender if it is ready
+                    // to send the next frame. i.e. don't requeue it if the
+                    // next frame is a data frame and the stream does not
+                    // have any more capacity.
+                    self.pending_send.push(&mut stream);
+                }
+                counts.transition_after(stream, is_pending_reset);
+                return Some(frame);
             }
         }
     }

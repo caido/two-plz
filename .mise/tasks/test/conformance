@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+#MISE description="Run h2spec against the HTTP/2 server"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**/*.rs", "examples/h2spec_server.rs", ".mise/tasks/test/conformance"]
+#MISE outputs={ auto = true }
+
+set -euo pipefail
+
+readonly H2SPEC_VERSION=2.1.1
+readonly LISTEN_ADDR=127.0.0.1
+readonly PORT=5928
+readonly SERVER_LOG="${TMPDIR:-/tmp}/two-plz-h2spec-server.log"
+readonly H2SPEC_JUNIT_REPORT="${H2SPEC_JUNIT_REPORT:-artifacts/h2spec.junit.xml}"
+
+server_pid=""
+
+cleanup() {
+    if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
+        kill "${server_pid}"
+        wait "${server_pid}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+h2spec_bin="${H2SPEC:-}"
+if [[ -z "${h2spec_bin}" ]]; then
+    cache_dir="${TMPDIR:-/tmp}/two-plz-h2spec-${H2SPEC_VERSION}"
+    mkdir -p "${cache_dir}"
+    h2spec_bin="${cache_dir}/h2spec"
+
+    if [[ ! -x "${h2spec_bin}" ]]; then
+        case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)
+                archive="h2spec_linux_amd64.tar.gz"
+                ;;
+            *)
+                echo "test:conformance requires Linux x86_64." >&2
+                exit 1
+                ;;
+        esac
+
+        curl --fail --location --retry 3 \
+            "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/${archive}" \
+            --output "${cache_dir}/${archive}"
+        tar -xzf "${cache_dir}/${archive}" -C "${cache_dir}"
+        chmod +x "${h2spec_bin}"
+    fi
+fi
+
+if [[ ! -x "${h2spec_bin}" ]]; then
+    echo "h2spec executable not found or not executable: ${h2spec_bin}" >&2
+    exit 1
+fi
+
+cargo build --example h2spec_server
+./target/debug/examples/h2spec_server >"${SERVER_LOG}" 2>&1 &
+server_pid=$!
+
+for _ in $(seq 1 100); do
+    if grep -q "h2spec server listening on ${LISTEN_ADDR}:${PORT}" "${SERVER_LOG}"; then
+        break
+    fi
+    if ! kill -0 "${server_pid}" 2>/dev/null; then
+        echo "h2spec server exited before becoming ready:" >&2
+        cat "${SERVER_LOG}" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+
+if ! grep -q "h2spec server listening on ${LISTEN_ADDR}:${PORT}" "${SERVER_LOG}"; then
+    echo "Timed out waiting for h2spec server:" >&2
+    cat "${SERVER_LOG}" >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "${H2SPEC_JUNIT_REPORT}")"
+if "${h2spec_bin}" -p "${PORT}" --junit-report "${H2SPEC_JUNIT_REPORT}"; then
+    echo "h2spec ${H2SPEC_VERSION} passed"
+else
+    status=$?
+    echo "h2spec failed; server log:" >&2
+    cat "${SERVER_LOG}" >&2
+    exit "${status}"
+fi

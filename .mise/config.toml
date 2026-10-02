@@ -1,0 +1,10 @@
+[tools]
+rust = { version = "1.98.1", components = "rustfmt,clippy" }
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
+"github:bahdotsh/wrkflw" = "0.8.0"
+zizmor = "1.25.2"
+"github:EmbarkStudios/cargo-deny" = "0.20.2"
+
+[settings]
+lockfile = true
+locked = true

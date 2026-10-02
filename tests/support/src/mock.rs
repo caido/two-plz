@@ -286,6 +286,21 @@ impl Handle {
     where
         T: Into<frame::Settings>,
     {
+        self.assert_client_handshake_with_settings_and_initial_ping(
+            settings, false,
+        )
+        .await
+    }
+
+    /// Perform the H2 handshake, optionally expecting the enhanced SPA PING.
+    pub async fn assert_client_handshake_with_settings_and_initial_ping<T>(
+        &mut self,
+        settings: T,
+        expect_initial_ping: bool,
+    ) -> frame::Settings
+    where
+        T: Into<frame::Settings>,
+    {
         let settings = settings.into();
         // Servers send their connection preface independently of the client
         // preface, so make it available before waiting for the client bytes.
@@ -315,10 +330,25 @@ impl Handle {
             }
         };
 
-        // read ack
-        let frame = self.next().await.unwrap().unwrap();
-        let f = assert_settings!(frame);
-        assert!(f.is_ack());
+        // The initial SPA PING may arrive before or after the SETTINGS ACK.
+        // Require exactly one of each, and answer the PING with its payload.
+        let mut received_ack = false;
+        let mut received_ping = !expect_initial_ping;
+        while !received_ack || !received_ping {
+            match self.recv_frame_raw().await {
+                Frame::Settings(ack) if !received_ack => {
+                    assert!(ack.is_ack());
+                    received_ack = true;
+                }
+                Frame::Ping(ping) if !received_ping => {
+                    assert!(!ping.is_ack());
+                    self.send_frame(frame::Ping::pong(ping.into_payload()))
+                        .await;
+                    received_ping = true;
+                }
+                frame => panic!("unexpected handshake frame: {frame:?}"),
+            }
+        }
 
         settings
     }

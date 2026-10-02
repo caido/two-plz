@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#MISE description="Format Rust code and run Clippy for development"
+
+set -euo pipefail
+
+echo "Formatting Rust code..."
+cargo fmt --all
+
+echo "Running Clippy..."
+cargo clippy --workspace --all-targets --all-features
