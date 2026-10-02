@@ -2,12 +2,43 @@
 """Render an h2spec JUnit report as a bounded Markdown PR comment."""
 
 import html
+import re
 import sys
 import xml.etree.ElementTree as ET
 
 
+def parse_report(report):
+    try:
+        return ET.fromstring(report)
+    except ET.ParseError:
+        # h2spec 2.1.1 uses Go's innerxml for diagnostic messages, which
+        # inserts text verbatim, including unescaped XML and control characters.
+        # Repair only diagnostic bodies; leave valid reports untouched.
+        def escape_diagnostic(match):
+            text = re.sub(
+                r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)",
+                "&amp;",
+                match.group(3),
+            )
+            text = text.replace("<", "&lt;").replace(">", "&gt;")
+            return match.group(1) + text + match.group(4)
+
+        report = re.sub(
+            r"(<(failure|error|skipped)\b[^>]*(?<!/)>)(.*?)(</\2\s*>)",
+            escape_diagnostic,
+            report,
+            flags=re.DOTALL,
+        )
+        report = re.sub(
+            r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]",
+            "\ufffd",
+            report,
+        )
+        return ET.fromstring(report)
+
+
 def render(report, run_url):
-    cases = list(ET.fromstring(report).iter("testcase"))
+    cases = list(parse_report(report).iter("testcase"))
     failed = [case for case in cases if case.find("failure") is not None]
     errors = [case for case in cases if case.find("error") is not None]
     skipped = [case for case in cases if case.find("skipped") is not None]

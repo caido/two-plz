@@ -130,19 +130,13 @@ async fn spa_post(#[case] mode: Mode) {
     let n = 30;
     let mode_clone = mode.clone();
     let srv_fut = async move {
-        let settings = srv.assert_client_handshake().await;
+        let settings = srv
+            .assert_client_handshake_with_settings_and_initial_ping(
+                frame::Settings::default(),
+                matches!(mode_clone, Mode::EnhancedPing(..)),
+            )
+            .await;
         assert_default_settings!(settings);
-        // enhanced ping mode recv ping
-        if let Mode::EnhancedPing(..) = mode_clone {
-            if let Frame::Ping(ping) = srv.recv_frame_raw().await {
-                let payload = ping.into_payload();
-                // send pong
-                srv.send_frame(frames::ping(payload).pong())
-                    .await;
-            } else {
-                panic!()
-            }
-        }
 
         // recv headers
         for i in (1..2 * n).step_by(2) {
@@ -231,19 +225,13 @@ async fn spa_get(#[case] mode: Mode) {
     let n = 30;
     let mode_clone = mode.clone();
     let srv_fut = async move {
-        let settings = srv.assert_client_handshake().await;
+        let settings = srv
+            .assert_client_handshake_with_settings_and_initial_ping(
+                frame::Settings::default(),
+                matches!(mode_clone, Mode::EnhancedPing(..)),
+            )
+            .await;
         assert_default_settings!(settings);
-        // enhanced ping mode recv ping
-        if let Mode::EnhancedPing(..) = mode_clone {
-            if let Frame::Ping(ping) = srv.recv_frame_raw().await {
-                let payload = ping.into_payload();
-                // send pong
-                srv.send_frame(frames::ping(payload).pong())
-                    .await;
-            } else {
-                panic!()
-            }
-        }
 
         // recv headers
         for i in (1..2 * n).step_by(2) {
@@ -328,19 +316,13 @@ async fn spa_basic_mixed(#[case] mode: Mode) {
 
     let mode_clone = mode.clone();
     let srv_fut = async move {
-        let settings = srv.assert_client_handshake().await;
+        let settings = srv
+            .assert_client_handshake_with_settings_and_initial_ping(
+                frame::Settings::default(),
+                matches!(mode_clone, Mode::EnhancedPing(..)),
+            )
+            .await;
         assert_default_settings!(settings);
-        // enhanced ping mode recv ping
-        if let Mode::EnhancedPing(..) = mode_clone {
-            if let Frame::Ping(ping) = srv.recv_frame_raw().await {
-                let payload = ping.into_payload();
-                // send pong
-                srv.send_frame(frames::ping(payload).pong())
-                    .await;
-            } else {
-                panic!()
-            }
-        }
         // headers
         for i in 0..n {
             let stream_id = (i * 2) + 1;
@@ -458,20 +440,12 @@ async fn spa_basic_post_stream_window_exhaust(#[case] mode: Mode) {
         // Streams start with 10 capacity
         settings.set_initial_window_size(Some(3));
         let settings = srv
-            .assert_client_handshake_with_settings(settings)
+            .assert_client_handshake_with_settings_and_initial_ping(
+                settings,
+                matches!(mode_clone, Mode::EnhancedPing(..)),
+            )
             .await;
         assert_default_settings!(settings);
-        // enhanced ping mode recv ping
-        if let Mode::EnhancedPing(..) = mode_clone {
-            if let Frame::Ping(ping) = srv.recv_frame_raw().await {
-                let payload = ping.into_payload();
-                // send pong
-                srv.send_frame(frames::ping(payload).pong())
-                    .await;
-            } else {
-                panic!()
-            }
-        }
         // headers
         for i in (1..2 * n).step_by(2) {
             srv.recv_frame(frames::headers(i).request(
@@ -574,20 +548,12 @@ async fn spa_basic_post_stream_window_exhaust_mixed(#[case] mode: Mode) {
         // Streams start with 10 capacity
         settings.set_initial_window_size(Some(3));
         let settings = srv
-            .assert_client_handshake_with_settings(settings)
+            .assert_client_handshake_with_settings_and_initial_ping(
+                settings,
+                matches!(mode_clone, Mode::EnhancedPing(..)),
+            )
             .await;
         assert_default_settings!(settings);
-        // enhanced ping mode recv ping
-        if let Mode::EnhancedPing(..) = mode_clone {
-            if let Frame::Ping(ping) = srv.recv_frame_raw().await {
-                let payload = ping.into_payload();
-                // send pong
-                srv.send_frame(frames::ping(payload).pong())
-                    .await;
-            } else {
-                panic!()
-            }
-        }
         // headers
         for i in (1..2 * n).step_by(2) {
             srv.recv_frame(frames::headers(i).request(
@@ -704,19 +670,13 @@ async fn spa_basic_post_conn_window(#[case] mode: Mode) {
     let n = 4;
     let mode_clone = mode.clone();
     let srv_fut = async move {
-        let settings = srv.assert_client_handshake().await;
+        let settings = srv
+            .assert_client_handshake_with_settings_and_initial_ping(
+                frame::Settings::default(),
+                matches!(mode_clone, Mode::EnhancedPing(..)),
+            )
+            .await;
         assert_default_settings!(settings);
-        // enhanced ping mode recv ping
-        if let Mode::EnhancedPing(..) = mode_clone {
-            if let Frame::Ping(ping) = srv.recv_frame_raw().await {
-                let payload = ping.into_payload();
-                // send pong
-                srv.send_frame(frames::ping(payload).pong())
-                    .await;
-            } else {
-                panic!()
-            }
-        }
         // headers
         for i in (1..2 * n).step_by(2) {
             srv.recv_frame(frames::headers(i).request(
