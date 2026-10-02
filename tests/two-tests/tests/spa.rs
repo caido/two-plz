@@ -6,6 +6,121 @@ use tokio::sync::oneshot;
 #[rstest]
 #[case::basic(Mode::default())]
 #[case::standard(Mode::ping())]
+#[tokio::test]
+async fn spa_initial_window_increase_with_pending_requests(
+    #[case] mode: Mode,
+) {
+    support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let n = 4;
+
+    let (conn, mut client) = ClientBuilder::new()
+        .single_packet_attack_mode(mode.clone())
+        .handshake(io)
+        .await
+        .expect("handshake");
+
+    // Queue every request before polling the driver, so the peer's initial
+    // SETTINGS increases the send window while the streams are pending_open.
+    let requests = (0..n)
+        .map(|i| {
+            if i % 2 == 0 {
+                build_test_request_post("http2.akamai.com")
+            } else {
+                build_test_request()
+            }
+        })
+        .collect();
+    let responses = client
+        .spa(requests)
+        .into_iter()
+        .map(|result| result.expect("queue SPA request"))
+        .collect::<FuturesUnordered<_>>();
+    assert_eq!(responses.len(), n as usize);
+
+    let srv_fut = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(
+                frames::settings().initial_window_size(1_048_576),
+            )
+            .await;
+        assert_default_settings!(settings);
+
+        for i in 0..n {
+            let method = if i % 2 == 0 {
+                "POST"
+            } else {
+                "GET"
+            };
+            srv.recv_frame(frames::headers(i * 2 + 1).request(
+                method,
+                "https",
+                "http2.akamai.com",
+                "/",
+            ))
+            .await;
+        }
+        for i in (0..n).step_by(2) {
+            srv.recv_frame(frames::data(i * 2 + 1, "hell"))
+                .await;
+        }
+
+        if matches!(mode, Mode::Ping(_)) {
+            let Frame::Ping(ping) = srv.recv_frame_raw().await else {
+                panic!("expected SPA ping before final DATA frames");
+            };
+            assert!(!ping.is_ack());
+            srv.send_frame(frames::ping(ping.into_payload()).pong())
+                .await;
+        }
+
+        for i in 0..n {
+            let payload = if i % 2 == 0 {
+                "o"
+            } else {
+                ""
+            };
+            srv.recv_frame(frames::data(i * 2 + 1, payload).eos())
+                .await;
+        }
+        for i in 0..n {
+            srv.send_frame(
+                frames::headers(i * 2 + 1)
+                    .response(200)
+                    .eos(),
+            )
+            .await;
+        }
+        done_rx
+            .await
+            .expect("client received all responses");
+    };
+
+    let client_fut = async move {
+        let conn_handle = tokio::spawn(async move {
+            conn.await.expect("h2 driver crashed");
+        });
+        let results: Vec<_> = responses.collect().await;
+        assert_eq!(results.len(), n as usize);
+        for result in results {
+            assert_eq!(*result.expect("SPA response").status(), 200);
+        }
+        done_tx
+            .send(())
+            .expect("server still connected");
+        drop(client);
+        conn_handle
+            .await
+            .expect("h2 driver task panicked");
+    };
+
+    join(srv_fut, client_fut).await;
+}
+
+#[rstest]
+#[case::basic(Mode::default())]
+#[case::standard(Mode::ping())]
 #[case::enhanced(Mode::enhanced())]
 #[tokio::test]
 async fn spa_post(#[case] mode: Mode) {
