@@ -239,26 +239,6 @@ impl Recv {
 
         let is_eos = frame.is_end_stream();
 
-        // If EOS check if entire body is received and state transition cauess
-        // err
-        if is_eos {
-            if stream
-                .ensure_content_length_zero()
-                .is_err()
-            {
-                return Err(ProtoError::library_reset(
-                    stream.id,
-                    Reason::PROTOCOL_ERROR,
-                ));
-            }
-
-            if stream.state.recv_close().is_err() {
-                return Err(ProtoError::library_go_away(
-                    Reason::PROTOCOL_ERROR,
-                ));
-            }
-        }
-
         // dec stream flow control
         stream
             .recv_flow
@@ -285,6 +265,21 @@ impl Recv {
                 stream.id,
                 Reason::INTERNAL_ERROR,
             ));
+        }
+
+        if is_eos {
+            // Retain accepted DATA for a partial response if the body is short.
+            stream
+                .ensure_content_length_zero()
+                .map_err(|()| {
+                    ProtoError::library_reset(
+                        stream.id,
+                        Reason::PROTOCOL_ERROR,
+                    )
+                })?;
+            stream.state.recv_close().map_err(|_| {
+                ProtoError::library_go_away(Reason::PROTOCOL_ERROR)
+            })?;
         }
 
         if stream.streaming_recv {
@@ -343,6 +338,10 @@ impl Recv {
 
         let stream_id = frame.stream_id();
         let is_eos = frame.is_end_stream();
+        let allows_content_length_without_body = frame
+            .pseudo()
+            .status
+            .is_some_and(|status| status == 204 || status == 304);
         let (pseudo, fields) = frame.into_parts();
 
         // check extended protocol and response headers in request
@@ -371,6 +370,18 @@ impl Recv {
             stream
                 .pending_recv
                 .push_back(&mut self.buffer, Event::Headers(message));
+
+            // Keep valid headers available when END_STREAM reveals a short body.
+            if is_eos && !allows_content_length_without_body {
+                stream
+                    .ensure_content_length_zero()
+                    .map_err(|()| {
+                        ProtoError::library_reset(
+                            stream.id,
+                            Reason::PROTOCOL_ERROR,
+                        )
+                    })?;
+            }
 
             let role = counts.role();
             if is_server && self.streaming {
@@ -426,22 +437,6 @@ impl Recv {
 
             stream.content_length =
                 ContentLength::Remaining(content_length, content_length);
-            // END_STREAM on headers frame with non-zero content-length is
-            // malformed.
-            // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
-            if frame.is_end_stream()
-                && content_length > 0
-                && frame
-                    .pseudo()
-                    .status
-                    .is_none_or(|status| status != 204 && status != 304)
-            {
-                error!("headers with END_STREAM| content-length is not zero");
-                return Err(ProtoError::library_reset(
-                    stream.id,
-                    Reason::PROTOCOL_ERROR,
-                ));
-            }
         }
         Ok(())
     }
@@ -1057,14 +1052,9 @@ fn process_remaining_frames<T>(
             }
             Event::Data(data) => {
                 let buf = body.get_or_insert_with(|| {
-                    let capacity = stream
-                        .content_length()
-                        .map(|size| size as usize)
-                        // assume atleast two data frames of same size
-                        // are received
-                        .unwrap_or_else(|| data.len() * 2);
-
-                    BytesMut::with_capacity(capacity)
+                    // Content-Length is untrusted and may greatly exceed the
+                    // bytes received, especially when returning a partial body.
+                    BytesMut::with_capacity(stream.curr_buf_len)
                 });
 
                 buf.reserve(data.len());

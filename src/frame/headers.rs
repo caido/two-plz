@@ -364,23 +364,35 @@ impl fmt::Debug for Headers {
 pub struct ParseU64Error;
 
 pub fn parse_u64(src: &[u8]) -> Result<u64, ParseU64Error> {
-    if src.len() > 19 {
-        // At danger for overflow...
+    if src.is_empty() {
         return Err(ParseU64Error);
     }
 
-    let mut ret = 0;
+    let mut ret = 0u64;
 
     for &d in src {
         if !d.is_ascii_digit() {
             return Err(ParseU64Error);
         }
 
-        ret *= 10;
-        ret += (d - b'0') as u64;
+        ret = ret
+            .checked_mul(10)
+            .and_then(|value| value.checked_add((d - b'0') as u64))
+            .ok_or(ParseU64Error)?;
     }
 
     Ok(ret)
+}
+
+#[cfg(test)]
+#[test]
+fn content_length_integer_boundaries() {
+    assert_eq!(parse_u64(b"0"), Ok(0));
+    assert_eq!(parse_u64(b"00000000000000000000001"), Ok(1));
+    assert_eq!(parse_u64(b"18446744073709551615"), Ok(u64::MAX));
+    for invalid in [b"".as_slice(), b"18446744073709551616", b"-1", b"1x"] {
+        assert_eq!(parse_u64(invalid), Err(ParseU64Error));
+    }
 }
 
 // ===== impl PushPromise =====
