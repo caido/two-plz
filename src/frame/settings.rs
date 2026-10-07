@@ -14,6 +14,8 @@ pub struct Settings {
     max_frame_size: Option<u32>,
     max_header_list_size: Option<u32>,
     enable_connect_protocol: Option<u32>,
+    // Preserve zero values that would otherwise be hidden by duplicate settings.
+    connect_protocol_disabled: bool,
 }
 
 /// An enum that lists all valid settings that can be sent in a SETTINGS
@@ -118,6 +120,11 @@ impl Settings {
 
     pub fn set_enable_connect_protocol(&mut self, val: Option<u32>) {
         self.enable_connect_protocol = val;
+        self.connect_protocol_disabled = val == Some(0);
+    }
+
+    pub(crate) fn disables_connect_protocol(&self) -> bool {
+        self.connect_protocol_disabled
     }
 
     pub fn header_table_size(&self) -> Option<u32> {
@@ -199,7 +206,13 @@ impl Settings {
                 }
                 Some(EnableConnectProtocol(val)) => match val {
                     0 | 1 => {
+                        if settings.enable_connect_protocol == Some(1)
+                            && val == 0
+                        {
+                            return Err(Error::InvalidSettingValue);
+                        }
                         settings.enable_connect_protocol = Some(val);
+                        settings.connect_protocol_disabled |= val == 0;
                     }
                     _ => {
                         return Err(Error::InvalidSettingValue);
@@ -394,5 +407,54 @@ impl fmt::Debug for SettingsFlags {
         util::debug_flags(f, self.0)
             .flag_if(self.is_ack(), "ACK")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(values: &[u32]) -> Settings {
+        let mut payload = Vec::new();
+        for value in values {
+            payload.extend_from_slice(&[0, 8]);
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        Settings::load(
+            Head::new(Kind::Settings, 0, StreamId::zero()),
+            &payload,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn connect_protocol_metadata_matches_setter_and_parser() {
+        let mut settings = Settings::default();
+        assert_eq!(settings, load(&[]));
+        for value in [0, 1] {
+            settings.set_enable_connect_protocol(Some(value));
+            assert_eq!(settings, load(&[value]));
+        }
+        settings.set_enable_connect_protocol(None);
+        assert_eq!(settings, load(&[]));
+        assert_eq!(
+            Settings::ack(),
+            Settings::load(
+                Head::new(Kind::Settings, ACK, StreamId::zero()),
+                &[],
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn duplicate_connect_protocol_preserves_zero_evidence() {
+        let settings = load(&[0, 1]);
+        assert_eq!(
+            settings.is_extended_connect_protocol_enabled(),
+            Some(true)
+        );
+        assert!(settings.disables_connect_protocol());
+        assert!(!load(&[1, 1]).disables_connect_protocol());
     }
 }

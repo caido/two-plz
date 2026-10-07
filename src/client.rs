@@ -154,6 +154,9 @@ pub struct SendRequest {
 }
 
 impl SendRequest {
+    /// Sends a buffered request. Extended CONNECT requires the peer's enabling
+    /// SETTINGS to have been received and processed by the connection first.
+    /// Otherwise the request is rejected without allocating a stream ID.
     pub fn send_request(
         &mut self,
         request: Request,
@@ -168,7 +171,9 @@ impl SendRequest {
 
     /// Sends headers immediately and returns independent response and upload
     /// handles. The request must not contain a buffered body or trailers.
-    /// Streaming is not supported in single-packet-attack mode.
+    /// Streaming is not supported in single-packet-attack mode. Extended CONNECT
+    /// requires the peer's enabling SETTINGS to have been received and processed
+    /// by the connection first; unnegotiated requests are rejected locally.
     pub fn send_request_streaming(
         &mut self,
         request: Request,

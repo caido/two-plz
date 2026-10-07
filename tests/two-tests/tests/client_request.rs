@@ -1764,6 +1764,20 @@ async fn extended_connect_request() {
             .await
             .expect("handshake");
 
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| {
+                let result = Pin::new(&mut conn).poll(cx);
+                assert!(result.is_pending());
+                if conn.is_extended_connect_protocol_enabled() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("peer did not enable extended CONNECT");
         let uri = Uri::builder()
             .authority("bread")
             .scheme(Scheme::HTTP)

@@ -67,6 +67,8 @@ pub(crate) struct Stream {
     pub is_buf_limit_reached: bool,
     pub recv_flow: FlowControl,
     pub content_length: ContentLength,
+    /// Locally initiated CONNECT requests ignore content-length on 2xx responses.
+    pub is_connect: bool,
     /// When the RecvStream drop occurs, no data should be received.
     /// TODO: why?
     pub _is_recv: bool,
@@ -126,6 +128,7 @@ impl Stream {
             is_buf_limit_reached: false,
             recv_flow: FlowControl::new(init_recv_window),
             content_length: ContentLength::Omitted,
+            is_connect: false,
             _is_recv: true,
             recv_task: None,
             // next accept

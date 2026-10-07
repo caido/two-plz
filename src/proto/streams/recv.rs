@@ -322,8 +322,16 @@ impl Recv {
             counts.inc_num_recv_streams(stream);
         }
 
-        // parse the content length
-        if !stream.content_length.is_head() {
+        // RFC 9110 section 9.3.6 requires clients to ignore content-length on
+        // successful CONNECT responses: subsequent DATA belongs to the tunnel.
+        let successful_connect = stream.is_connect
+            && frame
+                .pseudo()
+                .status
+                .is_some_and(|status| (200..300).contains(&status.as_u16()));
+        if successful_connect {
+            stream.content_length = super::stream::ContentLength::Omitted;
+        } else if !stream.content_length.is_head() {
             Self::parse_content_length(stream, &frame)?;
         }
 
@@ -340,6 +348,12 @@ impl Recv {
         // check extended protocol and response headers in request
         if !self.is_extended_protocol_usage_correct(&pseudo, is_server)
             || Self::are_response_headers_in_request(&pseudo, is_server)
+            || (!is_server
+                && (pseudo.method.is_some()
+                    || pseudo.scheme.is_some()
+                    || pseudo.authority.is_some()
+                    || pseudo.path.is_some()
+                    || pseudo.protocol.is_some()))
         {
             return Err(ProtoError::library_reset(
                 stream.id,
@@ -569,9 +583,7 @@ impl Recv {
         self.move_from_pending_complete(stream, &counts.role());
         stream.notify_recv();
 
-        // TODO(ws)
-        //stream.notify_push();
-        //stream.notify_send();
+        // The caller also clears the send queue, waking any streaming writer.
         Ok(())
     }
 
@@ -676,9 +688,7 @@ impl Recv {
         // If a receiver is waiting, notify it
         stream.notify_recv();
 
-        // TODO(ws)
-        //stream.notify_send();
-        //stream.notify_push();
+        // The caller also clears the send queue, waking any streaming writer.
     }
 
     // ====== Window Update =====
@@ -807,9 +817,7 @@ impl Recv {
     pub fn recv_eof(&mut self, stream: &mut Stream) {
         stream.state.recv_eof();
         stream.notify_recv();
-        // TODO(ws)
-        //stream.notify_send();
-        //stream.notify_push();
+        // The caller also clears the send queue, waking any streaming writer.
     }
 
     // ===== Clear =====

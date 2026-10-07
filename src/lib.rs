@@ -39,5 +39,7 @@ pub mod server;
 pub use crate::proto::connection::Connection;
 pub use codec::Codec;
 pub use message::{BodyFrame, RecvBody, SendBody};
+pub mod tunnel;
+pub use tunnel::Tunnel;
 pub mod hpack;
 pub mod spa;

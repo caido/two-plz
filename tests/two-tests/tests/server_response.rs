@@ -1098,8 +1098,6 @@ async fn extended_connect_protocol_disabled_by_default() {
     join(client, srv).await;
 }
 
-// TODO: Connect request EOS ?
-#[ignore]
 #[tokio::test]
 async fn extended_connect_protocol_enabled_during_handshake() {
     support::trace_init!();
@@ -1121,7 +1119,16 @@ async fn extended_connect_protocol_enabled_during_handshake() {
             .await;
 
         client
-            .recv_frame(frames::reset(1).protocol_error())
+            .recv_frame(frames::headers(1).response(200))
+            .await;
+        client
+            .send_frame(frames::data(1, "hello").eos())
+            .await;
+        client
+            .recv_frame(frames::data(1, "world"))
+            .await;
+        client
+            .recv_frame(frames::data(1, "").eos())
             .await;
     };
 
@@ -1132,20 +1139,33 @@ async fn extended_connect_protocol_enabled_during_handshake() {
             .await
             .unwrap();
 
-        //let (req, resp) = s.next().await.unwrap().unwrap();
-        //assert_eq!(req.method(), Method::CONNECT);
-        //dbg!(&req);
-
-        // TODO: implement
-        //assert_eq!(
-        //    req.extensions()
-        //        .get::<crate::ext::Protocol>(),
-        //    Some(&crate::ext::Protocol::from_static("the-bread-protocol"))
-        //);
-
-        poll_fn(move |cx| s.poll_closed(cx))
+        let (req, body, mut resp) = s
+            .accept_streaming()
             .await
-            .expect("server");
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.method(), &Method::CONNECT);
+        let send = resp
+            .send_response_streaming(build_test_response(), false)
+            .unwrap();
+        let mut tunnel = two_plz::Tunnel::new(body, send).unwrap();
+        let exchange = async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut data = Vec::new();
+            tunnel
+                .read_to_end(&mut data)
+                .await
+                .unwrap();
+            assert_eq!(data, b"hello");
+            tunnel
+                .write_all(b"world")
+                .await
+                .unwrap();
+            tunnel.shutdown().await.unwrap();
+        };
+        let drive = poll_fn(|cx| s.poll_closed(cx));
+        let (_, result) = join(exchange, drive).await;
+        result.expect("server");
     };
 
     join(client, srv).await;
@@ -1208,6 +1228,7 @@ async fn reject_extended_connect_request_without_scheme() {
         client
             .send_frame(frames::headers(1).pseudo(Pseudo {
                 method: Method::CONNECT.into(),
+                authority: util::byte_str("example.com").into(),
                 path: util::byte_str("/").into(),
                 protocol: Protocol::from("the-bread-protocol").into(),
                 ..Default::default()
@@ -1251,6 +1272,7 @@ async fn reject_extended_connect_request_without_path() {
         client
             .send_frame(frames::headers(1).pseudo(Pseudo {
                 method: Method::CONNECT.into(),
+                authority: util::byte_str("example.com").into(),
                 scheme: util::byte_str("https").into(),
                 protocol: Protocol::from("the-bread-protocol").into(),
                 ..Default::default()

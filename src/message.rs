@@ -11,6 +11,30 @@ use header_plz::{
 };
 use http_plz::{Message, Request, Response};
 
+/// Validate an outbound extended CONNECT before allocating a stream ID.
+/// Every request extension is a :protocol value in this API.
+pub(crate) fn validate_extended_connect_request(
+    head: &RequestLine,
+) -> Result<(), crate::codec::UserError> {
+    let Some(extension) = head.extension() else {
+        return Ok(());
+    };
+    let protocol = Protocol::try_from(extension.clone())
+        .map_err(|_| crate::codec::UserError::MalformedHeaders)?;
+    let uri = head.uri();
+    if !protocol.is_valid()
+        || head.method() != &Method::CONNECT
+        || uri
+            .scheme()
+            .is_none_or(|scheme| scheme.as_str().is_empty())
+        || uri.path().is_empty()
+        || uri.authority().is_none_or(str::is_empty)
+    {
+        return Err(crate::codec::UserError::MalformedHeaders);
+    }
+    Ok(())
+}
+
 /// A received body chunk or the trailers that terminate a body.
 #[derive(Debug)]
 pub enum BodyFrame {
@@ -246,6 +270,14 @@ pub(crate) fn frames_to_request(
     // add protocol for CONNECT requests
     let has_protocol = pseudo.protocol.is_some();
     if has_protocol {
+        if !pseudo
+            .protocol
+            .as_ref()
+            .unwrap()
+            .is_valid()
+        {
+            malformed!("malformed headers| invalid :protocol token");
+        }
         if is_connect {
             b = b.extension(pseudo.protocol.unwrap().into_bytes());
         } else {
@@ -258,6 +290,14 @@ pub(crate) fn frames_to_request(
 
     // authority
     let mut has_authority = false;
+    if has_protocol
+        && pseudo
+            .authority
+            .as_ref()
+            .is_none_or(|a| a.is_empty())
+    {
+        malformed!("malformed headers| missing authority in extended CONNECT");
+    }
     if let Some(authority) = pseudo.authority {
         has_authority = true;
         uri_b = uri_b.authority(authority);
@@ -265,6 +305,9 @@ pub(crate) fn frames_to_request(
 
     // A :scheme is required, except CONNECT.
     if let Some(scheme) = pseudo.scheme {
+        if scheme.is_empty() {
+            malformed!("malformed headers| empty scheme");
+        }
         if is_connect && !has_protocol {
             malformed!("malformed headers| :scheme in CONNECT");
         }

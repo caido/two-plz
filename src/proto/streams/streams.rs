@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use http_plz::Request;
+use http_plz::{Message, Request};
 use tokio::io::AsyncWrite;
 use tracing::trace;
 
@@ -86,6 +86,21 @@ impl Streams<Bytes> {
             return Err(UserError::UnexpectedFrameType.into());
         }
 
+        let mut request = request;
+        let body = request.take_body();
+        let trailers = request.take_trailers();
+        let (head, headers) = request.into_message_head();
+        crate::message::validate_extended_connect_request(&head)?;
+        if head.extension().is_some()
+            && !me
+                .actions
+                .send
+                .is_extended_connect_protocol_enabled()
+        {
+            return Err(UserError::Rejected.into());
+        }
+        let request = Message::new(head, headers, body, trailers);
+
         let stream_id = me.actions.send.open()?;
 
         let mut stream = Stream::new(
@@ -94,6 +109,7 @@ impl Streams<Bytes> {
             me.actions.recv.init_window_sz(),
         );
 
+        stream.is_connect = *request.method() == Method::CONNECT;
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
         }
@@ -163,11 +179,25 @@ impl Streams<Bytes> {
             return Err(UserError::Rejected.into());
         }
         let mut request = request;
-        let is_head = *request.method() == Method::HEAD;
+        let body = request.take_body();
+        let trailers = request.take_trailers();
+        let (head, headers) = request.into_message_head();
+        crate::message::validate_extended_connect_request(&head)?;
+        if head.extension().is_some()
+            && !me
+                .actions
+                .send
+                .is_extended_connect_protocol_enabled()
+        {
+            return Err(UserError::Rejected.into());
+        }
+        let is_head = *head.method() == Method::HEAD;
+        let is_connect = *head.method() == Method::CONNECT;
         // Validate the streaming head before allocating a stream ID.
-        if request.take_body().is_some() || request.take_trailers().is_some() {
+        if body.is_some() || trailers.is_some() {
             return Err(UserError::UnexpectedFrameType.into());
         }
+        let request = Message::new(head, headers, body, trailers);
         let id = me.actions.send.open()?;
         let mut frames = TwoTwoFrame::from((id, request));
         if !end_stream {
@@ -179,6 +209,7 @@ impl Streams<Bytes> {
             me.actions.recv.init_window_sz(),
         );
         stream.streaming_recv = true;
+        stream.is_connect = is_connect;
         if is_head {
             stream.content_length = ContentLength::Head;
         }

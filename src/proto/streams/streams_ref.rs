@@ -165,6 +165,21 @@ impl StreamRef {
             .map(|result| result.map_err(Into::into))
     }
 
+    /// Wait until this stream's queued DATA has been handed to the codec.
+    pub fn poll_flush(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), crate::codec::SendError>> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.ensure_no_conn_error()?;
+        let stream = me.store.resolve(self.opaque.key);
+        me.actions
+            .send
+            .poll_flush(&stream, cx)
+            .map(|result| result.map_err(Into::into))
+    }
+
     pub fn send_trailers(
         &mut self,
         trailers: header_plz::HeaderMap,
