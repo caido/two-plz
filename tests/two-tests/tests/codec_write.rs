@@ -1,6 +1,40 @@
 use support::prelude::*;
 
 #[tokio::test]
+async fn write_priority_frames() {
+    for exclusive in [false, true] {
+        for weight in [0, 255] {
+            let payload = [
+                if exclusive {
+                    0x80
+                } else {
+                    0
+                },
+                0,
+                0,
+                3,
+                weight,
+            ];
+            let priority = frame::Priority::load(
+                frame::Head::new(frame::Kind::Priority, 0, 1.into()),
+                &payload,
+            )
+            .unwrap();
+            let mut expected = vec![0, 0, 5, 2, 0, 0, 0, 0, 1];
+            expected.extend_from_slice(&payload);
+            let io = mock_io::Builder::new()
+                .write(&expected)
+                .build();
+            let mut codec = Codec::from(io);
+            codec.buffer(priority.into()).unwrap();
+            futures::future::poll_fn(|cx| codec.flush(cx))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn write_continuation_frames() {
     // An invalid dependency ID results in a stream level error. The hpack
     // payload should still be decoded.

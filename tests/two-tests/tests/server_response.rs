@@ -206,6 +206,233 @@ async fn recv_invalid_authority() {
 }
 
 #[tokio::test]
+async fn recv_uppercase_header_resets_stream_and_serves_next_request() {
+    support::trace_init!();
+    let (mock, mut client) = mock::new();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+
+        // Literal HPACK names bypass the header builder's normalization.
+        // Indexed :method GET, :scheme https, and :path / precede
+        // literal :authority example.com and the invalid field X-Test: x.
+        client
+            .send_bytes(&[
+                0, 0, 26, 1, 5, 0, 0, 0,
+                1, // HEADERS, END_HEADERS | END_STREAM
+                0x82, 0x87, 0x84, 0x01, 11, b'e', b'x', b'a', b'm', b'p',
+                b'l', b'e', b'.', b'c', b'o', b'm', 0x00, 6, b'X', b'-', b'T',
+                b'e', b's', b't', 1, b'x',
+            ])
+            .await;
+        client
+            .recv_frame(frames::reset(1).protocol_error())
+            .await;
+        client
+            .send_frame(
+                frames::headers(3)
+                    .request("GET", "https", "example.com", "/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(3).response(200).eos())
+            .await;
+    };
+
+    let srv = async move {
+        let mut s = ServerBuilder::new()
+            .handshake(mock)
+            .await
+            .unwrap();
+        let (req, mut resp) = s.accept().await.unwrap().unwrap();
+        assert_eq!(req.method(), &Method::GET);
+        assert_eq!(resp.stream_id(), 3u32);
+        resp.send_response(build_test_response())
+            .unwrap();
+        assert!(s.accept().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
+async fn recv_missing_path_resets_stream_and_serves_next_request() {
+    recv_invalid_path_and_serve_next_request(None).await;
+}
+
+#[tokio::test]
+async fn recv_empty_path_resets_stream_and_serves_next_request() {
+    recv_invalid_path_and_serve_next_request(Some("")).await;
+}
+
+#[tokio::test]
+async fn recv_invalid_uri_path_resets_stream_and_serves_next_request() {
+    support::trace_init!();
+    let (mock, mut client) = mock::new();
+    let mut invalid: frame::Headers = frames::headers(1)
+        .request("GET", "https", "example.com", "/")
+        .eos()
+        .into();
+    invalid.pseudo_mut().path = Some(util::byte_str("/bad path"));
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        client.send_frame(invalid).await;
+        client
+            .recv_frame(frames::reset(1).protocol_error())
+            .await;
+        client
+            .send_frame(
+                frames::headers(3)
+                    .request("GET", "https", "example.com", "/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(3).response(200).eos())
+            .await;
+    };
+
+    let srv = async move {
+        let mut s = ServerBuilder::new()
+            .handshake(mock)
+            .await
+            .unwrap();
+        let (req, mut resp) = s.accept().await.unwrap().unwrap();
+        assert_eq!(req.method(), &Method::GET);
+        assert_eq!(resp.stream_id(), 3u32);
+        resp.send_response(build_test_response())
+            .unwrap();
+        assert!(s.accept().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+async fn recv_invalid_path_and_serve_next_request(path: Option<&str>) {
+    support::trace_init!();
+    let (mock, mut client) = mock::new();
+    let mut invalid: frame::Headers = frames::headers(1)
+        .request("GET", "https", "example.com", "/")
+        .eos()
+        .into();
+    invalid.pseudo_mut().path = path.map(util::byte_str);
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        client.send_frame(invalid).await;
+        client
+            .recv_frame(frames::reset(1).protocol_error())
+            .await;
+        client
+            .send_frame(
+                frames::headers(3)
+                    .request("GET", "https", "example.com", "/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(3).response(200).eos())
+            .await;
+    };
+
+    let srv = async move {
+        let mut s = ServerBuilder::new()
+            .handshake(mock)
+            .await
+            .unwrap();
+        let (req, mut resp) = s.accept().await.unwrap().unwrap();
+        assert_eq!(req.method(), &Method::GET);
+        assert_eq!(resp.stream_id(), 3u32);
+        resp.send_response(build_test_response())
+            .unwrap();
+        assert!(s.accept().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
+async fn recv_priority_on_idle_half_closed_and_closed_streams() {
+    support::trace_init!();
+    let (mock, mut client) = mock::new();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+
+        // PRIORITY on idle streams, including an even-numbered stream, must
+        // neither open them nor advance the last received request stream ID.
+        client
+            .send_bytes(&[
+                0, 0, 5, 2, 0, 0, 0, 0, 9, // PRIORITY on stream 9
+                0, 0, 0, 0, 15, // dependency 0, weight 16
+                0, 0, 5, 2, 0, 0, 0, 0, 2, // PRIORITY on stream 2
+                0, 0, 0, 0, 15,
+            ])
+            .await;
+        client
+            .send_frame(
+                frames::headers(1)
+                    .request("POST", "https", "example.com", "/")
+                    .eos(),
+            )
+            .await;
+        // The request has ended but the response is still open.
+        client
+            .send_bytes(&[0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 15])
+            .await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
+        // Both directions of stream 1 are now closed.
+        client
+            .send_bytes(&[0, 0, 5, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 15])
+            .await;
+
+        for id in [3, 9] {
+            client
+                .send_frame(
+                    frames::headers(id)
+                        .request("GET", "https", "example.com", "/")
+                        .eos(),
+                )
+                .await;
+            client
+                .recv_frame(frames::headers(id).response(200).eos())
+                .await;
+        }
+    };
+
+    let srv = async move {
+        let mut s = ServerBuilder::new()
+            .handshake(mock)
+            .await
+            .unwrap();
+        let (req, mut resp) = s.accept().await.unwrap().unwrap();
+        assert_eq!(req.method(), &Method::POST);
+        assert_eq!(resp.stream_id(), 1u32);
+        resp.send_response(build_test_response())
+            .unwrap();
+        for id in [3, 9] {
+            let (req, mut resp) = s.accept().await.unwrap().unwrap();
+            assert_eq!(req.method(), &Method::GET);
+            assert_eq!(resp.stream_id(), id as u32);
+            resp.send_response(build_test_response())
+                .unwrap();
+        }
+        drop(req);
+        assert!(s.accept().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
 async fn recv_connection_header() {
     support::trace_init!();
     let (mock, mut client) = mock::new();

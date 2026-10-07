@@ -148,7 +148,10 @@ pub(crate) fn frames_to_request(
         if is_connect && !has_protocol {
             malformed!("malformed headers| :scheme in CONNECT");
         }
-        let scheme = Scheme::try_from(scheme.as_str()).unwrap();
+        let scheme = match Scheme::try_from(scheme.as_str()) {
+            Ok(scheme) => scheme,
+            Err(_) => malformed!("malformed headers| invalid scheme"),
+        };
 
         // It's not possible to build an `Uri` from a scheme and path. So,
         // after validating is was a valid scheme, we just have to drop it
@@ -171,11 +174,14 @@ pub(crate) fn frames_to_request(
             malformed!("malformed headers| missing path");
         }
         uri_b = uri_b.path(path.as_str());
-    } else if is_connect && has_protocol {
-        malformed!("malformed headers| missing path in extended CONNECT");
+    } else if !is_connect || has_protocol {
+        malformed!("malformed headers| missing path");
     }
 
-    let uri = uri_b.build().unwrap();
+    let uri = match uri_b.build() {
+        Ok(uri) => uri,
+        Err(_) => malformed!("malformed headers| invalid URI"),
+    };
     b = b.uri(uri);
     b = b.headers(headers);
 
