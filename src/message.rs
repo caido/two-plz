@@ -28,7 +28,9 @@ pub(crate) fn validate_extended_connect_request(
             .scheme()
             .is_none_or(|scheme| scheme.as_str().is_empty())
         || uri.path().is_empty()
-        || uri.authority().is_none_or(str::is_empty)
+        || uri
+            .authority()
+            .is_none_or(str::is_empty)
     {
         return Err(crate::codec::UserError::MalformedHeaders);
     }

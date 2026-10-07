@@ -71,10 +71,10 @@ impl OpaqueStreamRef {
             .actions
             .recv
             .poll_body(cx, &mut stream);
-        if result.is_ready() {
-            if let Some(task) = me.actions.task.take() {
-                task.wake();
-            }
+        if result.is_ready()
+            && let Some(task) = me.actions.task.take()
+        {
+            task.wake();
         }
         result
     }

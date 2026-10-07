@@ -71,13 +71,17 @@ async fn rejected_raw_request_recovers(mut block: Vec<u8>) {
     let (io, mut client) = mock::new();
     let peer = async move {
         client.assert_server_handshake().await;
-        client.send_bytes(&raw_headers(1, &block)).await;
+        client
+            .send_bytes(&raw_headers(1, &block))
+            .await;
         client
             .recv_frame(frames::reset(1).reason(Reason::PROTOCOL_ERROR))
             .await;
         let mut valid = raw_extended_block();
         valid.push(0xbe); // First dynamic-table entry (index 62).
-        client.send_bytes(&raw_headers(3, &valid)).await;
+        client
+            .send_bytes(&raw_headers(3, &valid))
+            .await;
         client
             .recv_frame(frames::headers(3).response(200).eos())
             .await;
@@ -91,10 +95,14 @@ async fn rejected_raw_request_recovers(mut block: Vec<u8>) {
         let (request, mut respond) = server.accept().await.unwrap().unwrap();
         assert_eq!(request.method(), &Method::CONNECT);
         assert_eq!(
-            request.headers().value_of_key("x-recovery"),
+            request
+                .headers()
+                .value_of_key("x-recovery"),
             Some(&b"ok"[..])
         );
-        respond.send_response(build_test_response()).unwrap();
+        respond
+            .send_response(build_test_response())
+            .unwrap();
         assert!(server.accept().await.is_none());
     };
     tokio::time::timeout(Duration::from_secs(5), join(peer, server))

@@ -66,6 +66,10 @@ impl BuildConnection for Server {
 // Request => complete request
 // SendResponse.send_response(Response)
 
+/// Request headers, an incremental receive body, and the response sender
+/// returned by streaming acceptance.
+pub type StreamingRequest = (Request, crate::message::RecvBody, SendResponse);
+
 pub struct ServerConnection<T> {
     connection: Connection<T>,
     streaming_accept: Option<bool>,
@@ -80,20 +84,14 @@ where
     /// not mix it with buffered `accept`/`poll_accept` calls.
     pub async fn accept_streaming(
         &mut self,
-    ) -> Option<
-        Result<(Request, crate::message::RecvBody, SendResponse), OpError>,
-    > {
+    ) -> Option<Result<StreamingRequest, OpError>> {
         poll_fn(|cx| self.poll_accept_streaming(cx)).await
     }
 
     pub fn poll_accept_streaming(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<
-        Option<
-            Result<(Request, crate::message::RecvBody, SendResponse), OpError>,
-        >,
-    > {
+    ) -> Poll<Option<Result<StreamingRequest, OpError>>> {
         if self.streaming_accept == Some(false) {
             return Poll::Ready(Some(Err(UserError::Rejected.into())));
         }
