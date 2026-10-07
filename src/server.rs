@@ -48,6 +48,7 @@ impl BuildConnection for Server {
     {
         ServerConnection {
             connection: Connection::new(role, config, codec),
+            streaming_accept: None,
         }
     }
 
@@ -67,12 +68,59 @@ impl BuildConnection for Server {
 
 pub struct ServerConnection<T> {
     connection: Connection<T>,
+    streaming_accept: Option<bool>,
 }
 
 impl<T> ServerConnection<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Accepts request headers without waiting for the complete body.
+    /// Use streaming acceptance from the first poll of this connection and do
+    /// not mix it with buffered `accept`/`poll_accept` calls.
+    pub async fn accept_streaming(
+        &mut self,
+    ) -> Option<
+        Result<(Request, crate::message::RecvBody, SendResponse), OpError>,
+    > {
+        poll_fn(|cx| self.poll_accept_streaming(cx)).await
+    }
+
+    pub fn poll_accept_streaming(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<
+        Option<
+            Result<(Request, crate::message::RecvBody, SendResponse), OpError>,
+        >,
+    > {
+        if self.streaming_accept == Some(false) {
+            return Poll::Ready(Some(Err(UserError::Rejected.into())));
+        }
+        self.streaming_accept = Some(true);
+        self.connection
+            .streams
+            .set_streaming_accept();
+        if self.connection.poll(cx)?.is_ready() {
+            return Poll::Ready(None);
+        }
+        if let Some(inner) = self.connection.next_accept() {
+            let request = inner.take_request();
+            let body = crate::message::RecvBody {
+                inner: inner.opaque.clone(),
+                done: false,
+            };
+            return Poll::Ready(Some(Ok((
+                request,
+                body,
+                SendResponse {
+                    inner,
+                },
+            ))));
+        }
+        Poll::Pending
+    }
+
     pub async fn accept(
         &mut self,
     ) -> Option<Result<(Request, SendResponse), OpError>> {
@@ -83,6 +131,10 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<(Request, SendResponse), OpError>>> {
+        if self.streaming_accept == Some(true) {
+            return Poll::Ready(Some(Err(UserError::Rejected.into())));
+        }
+        self.streaming_accept = Some(false);
         if self.connection.poll(cx)?.is_ready() {
             // If the socket is closed, don't return anything
             // TODO: drop any pending streams
@@ -117,6 +169,9 @@ where
         &mut self,
         cx: &mut Context,
     ) -> Poll<Result<(), OpError>> {
+        if self.streaming_accept.is_none() {
+            self.streaming_accept = Some(false);
+        }
         self.connection
             .poll(cx)
             .map_err(Into::into)
@@ -185,6 +240,20 @@ impl SendResponse {
         response: Response,
     ) -> Result<(), UserError> {
         self.inner.send_response(response)
+    }
+
+    /// Sends response headers and returns a bounded incremental body sender.
+    /// The response must not contain a buffered body or trailers.
+    pub fn send_response_streaming(
+        &mut self,
+        response: Response,
+        end_stream: bool,
+    ) -> Result<crate::message::SendBody, OpError> {
+        self.inner
+            .send_response_streaming(response, end_stream)?;
+        Ok(crate::message::SendBody {
+            inner: self.inner.clone(),
+        })
     }
 
     pub fn send_reset(&mut self, reason: Reason) {

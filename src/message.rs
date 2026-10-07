@@ -11,6 +11,126 @@ use header_plz::{
 };
 use http_plz::{Message, Request, Response};
 
+/// A received body chunk or the trailers that terminate a body.
+#[derive(Debug)]
+pub enum BodyFrame {
+    Data(bytes::Bytes),
+    Trailers(HeaderMap),
+}
+
+/// An incremental receive body. Keep driving the connection while reading it.
+/// Flow-control capacity is returned when a frame is yielded, so callers should
+/// process each chunk before requesting the next rather than accumulate chunks.
+#[derive(Debug)]
+pub struct RecvBody {
+    pub(crate) inner: crate::proto::streams::OpaqueStreamRef,
+    pub(crate) done: bool,
+}
+
+impl RecvBody {
+    pub fn stream_id(&self) -> StreamId {
+        self.inner.stream_id()
+    }
+
+    pub async fn frame(
+        &mut self,
+    ) -> Option<Result<BodyFrame, crate::error::OpError>> {
+        futures::future::poll_fn(|cx| self.poll_frame(cx)).await
+    }
+
+    pub fn poll_frame(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<BodyFrame, crate::error::OpError>>>
+    {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let result = self.inner.poll_body(cx);
+        if matches!(result, std::task::Poll::Ready(None | Some(Err(_)))) {
+            self.done = true;
+        }
+        result
+    }
+}
+
+impl Drop for RecvBody {
+    fn drop(&mut self) {
+        if !self.done {
+            self.inner.abandon_body();
+        }
+    }
+}
+
+#[cfg(feature = "stream")]
+impl futures_core::Stream for RecvBody {
+    type Item = Result<BodyFrame, crate::error::OpError>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.poll_frame(cx)
+    }
+}
+
+/// An incremental send body. Writes wait for bounded queue capacity. Keep
+/// driving the connection while writing; completion means queued, not flushed.
+#[derive(Debug)]
+pub struct SendBody {
+    pub(crate) inner: crate::proto::streams::StreamRef,
+}
+
+impl SendBody {
+    pub fn stream_id(&self) -> StreamId {
+        self.inner.stream_id()
+    }
+
+    /// Sends a chunk, optionally ending the stream. If canceled while pending,
+    /// a prefix may already have been queued; use `poll_send_data` to retain the
+    /// remaining bytes across cancellation.
+    pub async fn send_data(
+        &mut self,
+        mut data: bytes::Bytes,
+        end_stream: bool,
+    ) -> Result<(), crate::error::OpError> {
+        futures::future::poll_fn(|cx| {
+            self.poll_send_data(cx, &mut data, end_stream)
+        })
+        .await
+    }
+
+    /// On Pending, `data` contains only the bytes not yet queued.
+    pub fn poll_send_data(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        data: &mut bytes::Bytes,
+        end_stream: bool,
+    ) -> std::task::Poll<Result<(), crate::error::OpError>> {
+        self.inner
+            .poll_send_data(cx, data, end_stream)
+            .map_err(Into::into)
+    }
+
+    pub fn send_trailers(
+        &mut self,
+        trailers: HeaderMap,
+    ) -> Result<(), crate::error::OpError> {
+        self.inner
+            .send_trailers(trailers)
+            .map_err(Into::into)
+    }
+
+    pub fn send_reset(&mut self, reason: Reason) {
+        self.inner.send_reset(reason);
+    }
+}
+
+impl Drop for SendBody {
+    fn drop(&mut self) {
+        self.inner.abandon_send();
+    }
+}
+
 pub trait IntoPseudo {
     fn into_pseudo(self) -> Pseudo;
 }

@@ -139,6 +139,82 @@ impl Streams<Bytes> {
         Ok(OpaqueStreamRef::new(self.inner.clone(), &mut stream))
     }
 
+    pub fn send_request_streaming(
+        &mut self,
+        request: Request,
+        end_stream: bool,
+        is_spa: bool,
+    ) -> Result<StreamRef, SendError> {
+        use super::stream::ContentLength;
+        use header_plz::Method;
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.ensure_no_conn_error()?;
+        me.actions
+            .send
+            .ensure_streaming_supported()?;
+        me.actions
+            .send
+            .ensure_next_stream_id()?;
+        if me.counts.role().is_server() {
+            return Err(UserError::UnexpectedFrameType.into());
+        }
+        if is_spa {
+            return Err(UserError::Rejected.into());
+        }
+        let mut request = request;
+        let is_head = *request.method() == Method::HEAD;
+        // Validate the streaming head before allocating a stream ID.
+        if request.take_body().is_some() || request.take_trailers().is_some() {
+            return Err(UserError::UnexpectedFrameType.into());
+        }
+        let id = me.actions.send.open()?;
+        let mut frames = TwoTwoFrame::from((id, request));
+        if !end_stream {
+            frames.header.unset_end_stream();
+        }
+        let mut stream = Stream::new(
+            id,
+            me.actions.send.init_window_sz(),
+            me.actions.recv.init_window_sz(),
+        );
+        stream.streaming_recv = true;
+        if is_head {
+            stream.content_length = ContentLength::Head;
+        }
+        let mut stream = me.store.insert(id, stream);
+        let mut buffer = self.send_buffer.inner.lock().unwrap();
+        if let Err(error) = me.actions.send.send_headers(
+            frames.header,
+            &mut buffer,
+            &mut stream,
+            &mut me.counts,
+            &mut me.actions.task,
+        ) {
+            stream.unlink();
+            stream.remove();
+            return Err(error.into());
+        }
+        if !end_stream {
+            me.actions.send.start_streaming(id);
+        }
+        me.refs += 1;
+        Ok(StreamRef::new(
+            self.inner.clone(),
+            &mut stream,
+            self.send_buffer.clone(),
+        ))
+    }
+
+    pub fn set_streaming_accept(&mut self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .actions
+            .recv
+            .streaming = true;
+    }
+
     // ===== Recv =====
     pub fn next_accept(&mut self) -> Option<StreamRef> {
         let mut me = self.inner.lock().unwrap();

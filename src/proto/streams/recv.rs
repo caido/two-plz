@@ -111,6 +111,7 @@ pub struct Recv {
 
     /// Max recv buffer limit
     pub max_recv_buf_limit: usize,
+    pub streaming: bool,
 }
 
 #[derive(Debug)]
@@ -148,6 +149,7 @@ impl Recv {
             check_connection_window_update: false,
             check_stream_window_update: None,
             max_recv_buf_limit: config.max_recv_buffer_size,
+            streaming: false,
         }
     }
 
@@ -169,7 +171,9 @@ impl Recv {
                 stream.id
             ),
         };
-        process_remaining_frames(&mut request, stream, &mut self.buffer);
+        if !stream.streaming_recv {
+            process_remaining_frames(&mut request, stream, &mut self.buffer);
+        }
         request
     }
 
@@ -261,6 +265,10 @@ impl Recv {
             .dec_window(size)
             .map_err(ProtoError::library_go_away)?;
 
+        if stream.streaming_recv {
+            self.flow.hold_capacity(size);
+            stream.recv_flow.hold_capacity(size);
+        }
         // increment current buffer length
         stream.curr_buf_len += size as usize;
 
@@ -279,7 +287,9 @@ impl Recv {
             ));
         }
 
-        if is_eos {
+        if stream.streaming_recv {
+            stream.notify_recv();
+        } else if is_eos {
             self.move_from_pending_complete(stream, role);
         }
 
@@ -349,6 +359,15 @@ impl Recv {
                 .push_back(&mut self.buffer, Event::Headers(message));
 
             let role = counts.role();
+            if is_server && self.streaming {
+                stream.streaming_recv = true;
+                self.pending_accept.push(stream);
+                return Ok(());
+            }
+            if stream.streaming_recv {
+                stream.notify_recv();
+                return Ok(());
+            }
             // for server,
             // if EOS is received for stream 3 and pending_complete contains
             // stream 1, we just add stream 3 pending complete to maintain order
@@ -505,7 +524,11 @@ impl Recv {
         stream
             .pending_recv
             .push_back(&mut self.buffer, Event::Trailers(frame.into_fields()));
-        self.move_from_pending_complete(stream, role);
+        if stream.streaming_recv {
+            stream.notify_recv();
+        } else {
+            self.move_from_pending_complete(stream, role);
+        }
         Ok(())
     }
 
@@ -634,7 +657,7 @@ impl Recv {
     }
 
     pub fn clear_stream_queue(&mut self, stream: &mut Stream) {
-        if stream.is_pending_complete {
+        if stream.is_pending_complete && !stream.streaming_recv {
             while let Some(frame) = stream
                 .pending_recv
                 .pop_front(&mut self.buffer)
@@ -879,6 +902,83 @@ impl Recv {
         }
         self.refused = None;
         Poll::Ready(Ok(()))
+    }
+
+    pub fn poll_streaming_response(
+        &mut self,
+        cx: &Context,
+        stream: &mut Ptr,
+    ) -> Poll<Result<Response, OpError>> {
+        stream
+            .state
+            .ensure_recv_open()
+            .map_err(OpError::from)?;
+        if let Some(event) = stream
+            .pending_recv
+            .pop_front(&mut self.buffer)
+        {
+            match event {
+                Event::Headers(PollMessage::Client(response)) => {
+                    return Poll::Ready(Ok(response));
+                }
+                _ => unreachable!("response headers must precede body"),
+            }
+        }
+        stream.recv_task = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    pub fn poll_body(
+        &mut self,
+        cx: &Context,
+        stream: &mut Ptr,
+    ) -> Poll<Option<Result<crate::message::BodyFrame, OpError>>> {
+        if let Err(error) = stream.state.ensure_recv_open() {
+            self.discard_streaming_body(stream);
+            return Poll::Ready(Some(Err(error.into())));
+        }
+        if let Some(event) = stream
+            .pending_recv
+            .pop_front(&mut self.buffer)
+        {
+            let frame = match event {
+                Event::Data(data) => {
+                    let size = data.len() as WindowSize;
+                    stream.curr_buf_len -= data.len();
+                    self.flow.release_capacity(size);
+                    stream.recv_flow.release_capacity(size);
+                    self.check_connection_window_update = true;
+                    crate::message::BodyFrame::Data(data)
+                }
+                Event::Trailers(trailers) => {
+                    crate::message::BodyFrame::Trailers(trailers)
+                }
+                Event::Headers(_) => unreachable!("headers already consumed"),
+            };
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        if stream.state.is_recv_end_stream() {
+            Poll::Ready(None)
+        } else {
+            stream.recv_task = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    pub fn discard_streaming_body(&mut self, stream: &mut Ptr) {
+        while let Some(event) = stream
+            .pending_recv
+            .pop_front(&mut self.buffer)
+        {
+            if let Event::Data(data) = event {
+                self.flow
+                    .release_capacity(data.len() as WindowSize);
+            }
+        }
+        let size = stream.curr_buf_len as WindowSize;
+        stream.recv_flow.release_capacity(size);
+        stream.curr_buf_len = 0;
+        self.check_connection_window_update = true;
     }
 
     pub fn poll_response(

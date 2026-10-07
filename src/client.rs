@@ -166,6 +166,32 @@ impl SendRequest {
             })
     }
 
+    /// Sends headers immediately and returns independent response and upload
+    /// handles. The request must not contain a buffered body or trailers.
+    /// Streaming is not supported in single-packet-attack mode.
+    pub fn send_request_streaming(
+        &mut self,
+        request: Request,
+        end_stream: bool,
+    ) -> Result<(StreamingResponseFuture, crate::message::SendBody), OpError>
+    {
+        let inner = self.inner.send_request_streaming(
+            request,
+            end_stream,
+            self.is_spa,
+        )?;
+        let response = StreamingResponseFuture {
+            inner: inner.opaque.clone(),
+            handed_off: false,
+        };
+        Ok((
+            response,
+            crate::message::SendBody {
+                inner,
+            },
+        ))
+    }
+
     pub fn num_active_streams(&self) -> usize {
         self.inner.num_active_streams()
     }
@@ -211,6 +237,46 @@ impl Future for ResponseFuture {
         self.inner
             .poll_response(cx)
             .map_err(Into::into)
+    }
+}
+
+/// Resolves as soon as final response headers arrive, without waiting for DATA.
+#[derive(Debug)]
+pub struct StreamingResponseFuture {
+    inner: OpaqueStreamRef,
+    handed_off: bool,
+}
+
+impl Drop for StreamingResponseFuture {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            self.inner.abandon_body();
+        }
+    }
+}
+
+impl StreamingResponseFuture {
+    pub fn stream_id(&self) -> StreamId {
+        self.inner.stream_id()
+    }
+}
+
+impl Future for StreamingResponseFuture {
+    type Output = Result<(Response, crate::message::RecvBody), OpError>;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Self::Output> {
+        let response = ready!(self.inner.poll_streaming_response(cx))?;
+        self.handed_off = true;
+        Poll::Ready(Ok((
+            response,
+            crate::message::RecvBody {
+                inner: self.inner.clone(),
+                done: false,
+            },
+        )))
     }
 }
 

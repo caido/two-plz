@@ -39,6 +39,18 @@ impl FlowControl {
         self.window.increase_by(sz)
     }
 
+    pub fn hold_capacity(&mut self, size: WindowSize) {
+        self.capacity
+            .decrease_by(size)
+            .expect("receive capacity underflow");
+    }
+
+    pub fn release_capacity(&mut self, size: WindowSize) {
+        self.capacity
+            .increase_by(size)
+            .expect("receive capacity overflow");
+    }
+
     /// Check if should send WINDOW_UPDATE
     pub fn should_send_window_update(&self) -> Option<WindowSize> {
         if self.window >= self.capacity {
