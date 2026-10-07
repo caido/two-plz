@@ -150,7 +150,7 @@ async fn reset_streams_dont_grow_memory_continuously() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
 
         for n in (1..(N * 2)).step_by(2) {
             client
@@ -203,7 +203,7 @@ async fn go_away_with_pending_accepting() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
 
         client
             .send_frame(
@@ -261,7 +261,7 @@ async fn pending_accept_reset_streams_decrement_too() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
 
         let mut id = 1;
         for _ in 0..M {

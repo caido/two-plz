@@ -277,6 +277,28 @@ impl Streams<Bytes> {
             })
     }
 
+    pub fn next_push(&mut self) -> Option<(Request, OpaqueStreamRef)> {
+        let inner = self.next_accept()?;
+        let request = {
+            let mut me = self.inner.lock().unwrap();
+            me.store
+                .resolve(inner.opaque.key)
+                .promised_request
+                .take()?
+        };
+        Some((request, inner.opaque))
+    }
+
+    pub fn recv_push_promise(
+        &mut self,
+        promise: frame::PushPromise,
+    ) -> Result<(), ProtoError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .recv_push_promise(&self.send_buffer, promise)
+    }
+
     // ===== FRAMES =====
 
     // ===== Data =====

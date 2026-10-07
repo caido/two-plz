@@ -50,6 +50,70 @@ impl StreamRef {
             .take_request(&mut stream)
     }
 
+    pub fn push_request(
+        &mut self,
+        mut request: Request,
+    ) -> Result<StreamRef, crate::codec::SendError> {
+        use super::{send::Send, stream::Stream};
+        use crate::message::IntoPseudo;
+        crate::frame::PushPromise::validate_request(&request)
+            .map_err(|_| UserError::MalformedHeaders)?;
+        Send::check_headers(request.headers())?;
+        if request.take_body().is_some() || request.take_trailers().is_some() {
+            return Err(UserError::MalformedHeaders.into());
+        }
+        let (head, fields) = request.into_message_head();
+        if head.extension().is_some()
+            || head
+                .uri()
+                .authority()
+                .is_none_or(str::is_empty)
+            || head.uri().path().is_empty()
+        {
+            return Err(UserError::MalformedHeaders.into());
+        }
+        let is_head = head.method() == &header_plz::Method::HEAD;
+        let pseudo = head.into_pseudo();
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.ensure_no_conn_error()?;
+        me.actions.send.ensure_push_enabled()?;
+        if !me.counts.role().is_server() {
+            return Err(UserError::UnexpectedFrameType.into());
+        }
+        let parent = me.store.resolve(self.opaque.key);
+        // Promises require an open or half-closed (remote) client stream.
+        if !parent.id.is_client_initiated()
+            || parent.state.is_send_closed()
+            || parent.state.is_idle()
+            || parent.state.is_scheduled_reset()
+        {
+            return Err(UserError::InactiveStreamId.into());
+        }
+        let parent_id = parent.id;
+        let id = me.actions.send.open()?;
+        let mut stream = Stream::new(
+            id,
+            me.actions.send.init_window_sz(),
+            me.actions.recv.init_window_sz(),
+        );
+        stream.state.reserve_local()?;
+        stream.is_push_head = is_head;
+        let mut stream = me.store.insert(id, stream);
+        me.refs += 1;
+        let result = StreamRef::new(
+            self.opaque.inner.clone(),
+            &mut stream,
+            self.send_buffer.clone(),
+        );
+        me.actions.send.queue_push(
+            crate::frame::PushPromise::new(parent_id, id, pseudo, fields),
+            &mut stream,
+            &mut me.actions.task,
+        );
+        Ok(result)
+    }
+
     pub fn send_response(
         &mut self,
         response: Response,
@@ -74,6 +138,11 @@ impl StreamRef {
         let mut response_frames = TwoTwoFrame::from((stream.id, response));
         let data_frame = response_frames.take_data();
         let trailer_frame = response_frames.take_trailer();
+        if stream.is_push_head
+            && (data_frame.is_some() || trailer_frame.is_some())
+        {
+            return Err(UserError::MalformedHeaders);
+        }
 
         me.counts
             .transition(stream, |counts, stream| {
@@ -112,6 +181,9 @@ impl StreamRef {
             .send
             .ensure_streaming_supported()?;
         let stream = me.store.resolve(self.opaque.key);
+        if stream.is_push_head && !end_stream {
+            return Err(UserError::MalformedHeaders.into());
+        }
         let mut frames = TwoTwoFrame::from((stream.id, response));
         if frames.take_data().is_some() || frames.take_trailer().is_some() {
             return Err(UserError::UnexpectedFrameType.into());

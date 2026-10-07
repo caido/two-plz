@@ -898,7 +898,7 @@ async fn window_size_does_not_underflow() {
 
     let client_fut = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frame::Settings::default());
 
         // invalid HEADERS frame (missing mandatory fields).
         client
@@ -944,7 +944,7 @@ async fn too_many_window_update_resets_causes_go_away() {
 
     let client_fut = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frame::Settings::default());
 
         // Send 10 streams with invalid window updates
         for s in (1..21).step_by(2) {

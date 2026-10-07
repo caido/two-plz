@@ -36,7 +36,7 @@ async fn recv_multiple_pings() {
 
     let client = async move {
         let settings = handle.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         handle
             .send_frame(frames::ping([1; 8]))
             .await;
@@ -72,7 +72,7 @@ async fn pong_has_highest_priority() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(frames::headers(1).request(
                 "POST",

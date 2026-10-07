@@ -103,7 +103,7 @@ async fn server_out_of_order_complete() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frame::Settings::default());
         client
             .send_frame(
                 frames::headers(1).request("POST", "https", "a.b", "/"),
@@ -214,7 +214,7 @@ async fn server_reset_get() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frame::Settings::default());
         client
             .send_frame(
                 frames::headers(1)
@@ -344,7 +344,7 @@ async fn server_reset_pending_send() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frame::Settings::default());
         client
             .send_frame(
                 frames::headers(1)
@@ -444,7 +444,7 @@ async fn server_reset_pending_recv() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frame::Settings::default());
         client
             .send_frame(
                 frames::headers(1).request("POST", "https", "a.b", "/"),

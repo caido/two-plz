@@ -14,7 +14,7 @@ impl MockH2 for mock_io::Builder {
         self.write(MAGIC_PREFACE)
             // Settings frame
             .write(frames::NEW_SETTINGS)
-            .read(frames::NEW_SETTINGS)
+            .read(frames::SETTINGS)
             .write(frames::SETTINGS_ACK)
             .read(frames::SETTINGS_ACK)
     }
@@ -710,8 +710,7 @@ async fn request_with_connection_headers() {
     let (io, mut srv) = mock::new();
 
     let srv_fut = async move {
-        srv.send_frame(frames::new_settings())
-            .await;
+        srv.send_frame(frames::settings()).await;
         srv.read_preface().await.unwrap();
         srv.recv_frame(frames::new_settings())
             .await;

@@ -233,6 +233,20 @@ pub struct SendResponse {
 }
 
 impl SendResponse {
+    /// Promises a GET or HEAD request on this client-initiated stream.
+    /// The request must have an authority and no body, trailers, or protocol
+    /// extension. Fails when the peer disables push or this stream is closed.
+    /// Use the returned sender for the pushed response and keep driving the
+    /// connection. Push reception is not supported by this crate's client.
+    pub fn push_request(
+        &mut self,
+        request: Request,
+    ) -> Result<SendResponse, OpError> {
+        Ok(SendResponse {
+            inner: self.inner.push_request(request)?,
+        })
+    }
+
     pub fn send_response(
         &mut self,
         response: Response,

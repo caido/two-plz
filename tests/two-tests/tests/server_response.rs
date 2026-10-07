@@ -22,7 +22,7 @@ async fn read_preface_in_multiple_frames() {
     let mock = mock_io::Builder::new()
         .read(b"PRI * HTTP/2.0")
         .read(b"\r\n\r\nSM\r\n\r\n")
-        .write(NEW_SETTINGS)
+        .write(frames::SETTINGS)
         .read(NEW_SETTINGS)
         .write(SETTINGS_ACK)
         .read(SETTINGS_ACK)
@@ -43,7 +43,6 @@ async fn server_builder_set_max_concurrent_streams() {
 
     let mut settings = frame::Settings::default();
     settings.set_max_concurrent_streams(Some(1));
-    settings.set_enable_push(false);
 
     let client = async move {
         let recv_settings = client.assert_server_handshake().await;
@@ -99,7 +98,7 @@ async fn serve_request() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)
@@ -134,7 +133,7 @@ async fn serve_connect() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)
@@ -176,7 +175,7 @@ async fn recv_invalid_authority() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client.send_frame(bad_headers).await;
         client
             .recv_frame(frames::headers(1).response(200).eos())
@@ -212,7 +211,7 @@ async fn recv_uppercase_header_resets_stream_and_serves_next_request() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
 
         // Literal HPACK names bypass the header builder's normalization.
         // Indexed :method GET, :scheme https, and :path / precede
@@ -279,7 +278,7 @@ async fn recv_invalid_uri_path_resets_stream_and_serves_next_request() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client.send_frame(invalid).await;
         client
             .recv_frame(frames::reset(1).protocol_error())
@@ -323,7 +322,7 @@ async fn recv_invalid_path_and_serve_next_request(path: Option<&str>) {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client.send_frame(invalid).await;
         client
             .recv_frame(frames::reset(1).protocol_error())
@@ -363,7 +362,7 @@ async fn recv_priority_on_idle_half_closed_and_closed_streams() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
 
         // PRIORITY on idle streams, including an even-numbered stream, must
         // neither open them nor advance the last received request stream ID.
@@ -446,7 +445,7 @@ async fn recv_connection_header() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(req(1, "connection", "foo"))
             .await;
@@ -497,7 +496,7 @@ async fn abrupt_shutdown() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)
@@ -542,7 +541,7 @@ async fn graceful_shutdown() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)
@@ -633,7 +632,7 @@ async fn goaway_even_if_client_sent_goaway() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(5)
@@ -696,7 +695,7 @@ async fn sends_reset_cancel_when_res_is_dropped() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)
@@ -733,12 +732,7 @@ async fn too_big_headers_sends_431() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_frame_eq(
-            settings,
-            frames::settings()
-                .max_header_list_size(10)
-                .disable_push(),
-        );
+        assert_frame_eq(settings, frames::settings().max_header_list_size(10));
         client
             .send_frame(
                 frames::headers(1)
@@ -774,12 +768,7 @@ async fn too_big_headers_sends_reset_after_431_if_not_eos() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_frame_eq(
-            settings,
-            frames::settings()
-                .max_header_list_size(10)
-                .disable_push(),
-        );
+        assert_frame_eq(settings, frames::settings().max_header_list_size(10));
         client
             .send_frame(
                 frames::headers(1)
@@ -818,9 +807,7 @@ async fn too_many_continuation_frames_sends_goaway() {
         let settings = client.assert_server_handshake().await;
         assert_frame_eq(
             settings,
-            frames::settings()
-                .max_header_list_size(1024 * 32)
-                .disable_push(),
+            frames::settings().max_header_list_size(1024 * 32),
         );
         client
             .send_frame(
@@ -883,7 +870,7 @@ async fn pending_accept_recv_illegal_content_length_data() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)
@@ -933,7 +920,7 @@ async fn server_error_on_status_in_request() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(frames::headers(1).status(StatusCode::OK))
             .await;
@@ -961,7 +948,7 @@ async fn request_without_authority() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)
@@ -997,7 +984,7 @@ async fn send_reset_explicitly() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)
@@ -1031,7 +1018,7 @@ async fn send_reset_explicitly_does_not_affect_local_limit() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         for s in (1..9).step_by(2) {
             client
                 .send_frame(
@@ -1455,7 +1442,7 @@ async fn serve_response_empty_body() {
 
     let client = async move {
         let settings = client.assert_server_handshake().await;
-        assert_default_settings!(settings);
+        assert_frame_eq(settings, frames::settings());
         client
             .send_frame(
                 frames::headers(1)

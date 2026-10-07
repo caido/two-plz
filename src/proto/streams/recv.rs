@@ -98,7 +98,7 @@ pub struct Recv {
     reset_duration: Duration,
 
     /// If push promises are allowed to be received.
-    _is_push_enabled: bool,
+    pub is_push_enabled: bool,
 
     /// If extended connect protocol is enabled.
     is_extended_connect_protocol_enabled: bool,
@@ -143,7 +143,11 @@ impl Recv {
             pending_complete: Queue::new(),
             pending_reset_expired: Queue::new(),
             reset_duration: config.reset_stream_duration,
-            _is_push_enabled: false,
+            is_push_enabled: role.is_client()
+                && config
+                    .local_settings
+                    .is_push_enabled()
+                    .unwrap_or(false),
             is_extended_connect_protocol_enabled: false,
             refused: None,
             check_connection_window_update: false,
@@ -151,6 +155,10 @@ impl Recv {
             max_recv_buf_limit: config.max_recv_buffer_size,
             streaming: false,
         }
+    }
+
+    pub fn queue_push(&mut self, stream: &mut Ptr) {
+        self.pending_accept.push(stream);
     }
 
     pub fn next_accept(&mut self, store: &mut Store) -> Option<Key> {
@@ -306,6 +314,16 @@ impl Recv {
         stream: &mut Ptr,
         counts: &mut Counts,
     ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+        if !stream.is_counted
+            && stream.is_remote_push
+            && !counts.can_inc_num_recv_streams()
+        {
+            return Err(ProtoError::library_reset(
+                stream.id,
+                Reason::REFUSED_STREAM,
+            )
+            .into());
+        }
         let is_initial = stream.state.recv_open(&frame)?;
 
         if is_initial {
@@ -314,7 +332,9 @@ impl Recv {
                 self.last_processed_id = frame.stream_id();
             }
             // Increment the number of concurrent streams
-            counts.inc_num_recv_streams(stream);
+            if !stream.is_counted {
+                counts.inc_num_recv_streams(stream);
+            }
         }
 
         // RFC 9110 section 9.3.6 requires clients to ignore content-length on
@@ -734,6 +754,7 @@ impl Recv {
         role: &Role,
     ) -> Result<Option<StreamId>, ProtoError> {
         assert!(self.refused.is_none());
+        let is_push = mode.is_push_promise();
         role.ensure_can_open(id, mode)?;
         let next_id = self.next_stream_id()?;
         if id < next_id {
@@ -742,7 +763,7 @@ impl Recv {
         }
         self.next_stream_id = id.next_id();
 
-        if !counts.can_inc_num_recv_streams() {
+        if !is_push && !counts.can_inc_num_recv_streams() {
             self.refused = Some(id);
             return Ok(None);
         }

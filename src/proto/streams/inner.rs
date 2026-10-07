@@ -128,6 +128,124 @@ impl Inner {
             })
     }
 
+    pub fn recv_push_promise(
+        &mut self,
+        send_buffer: &SendBuffer<Bytes>,
+        promise: frame::PushPromise,
+    ) -> Result<(), ProtoError> {
+        let parent_id = promise.stream_id();
+        let id = promise.promised_id();
+        let role = self.counts.role();
+        if !role.is_client() || !self.actions.recv.is_push_enabled {
+            return Err(ProtoError::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+        if parent_id.is_zero() || !parent_id.is_client_initiated() {
+            return Err(ProtoError::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+        let cancel = if let Some(parent) = self.store.find_mut(&parent_id) {
+            let cancel = parent.state.is_local_error();
+            if (!cancel
+                && !parent.state.is_recv_headers()
+                && !parent.state.is_recv_streaming())
+                || parent.state.is_idle()
+            {
+                return Err(ProtoError::library_go_away(
+                    Reason::PROTOCOL_ERROR,
+                ));
+            }
+            cancel
+        } else if self
+            .actions
+            .is_forgotten_stream(&role, parent_id)
+        {
+            // Reset retention is bounded. A promise can still be in flight
+            // after its parent has been forgotten; reserve and cancel it.
+            true
+        } else {
+            return Err(ProtoError::library_go_away(Reason::PROTOCOL_ERROR));
+        };
+        if id.is_zero() || self.store.find_mut(&id).is_some() {
+            return Err(ProtoError::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+        self.actions.recv.can_open(
+            id,
+            Open::_PushPromise,
+            &mut self.counts,
+            &role,
+        )?;
+        // Bound reservations independently of active-stream concurrency. Include
+        // promises handed to callers that have not received response headers.
+        let mut reserved = 0;
+        self.store.for_each(|stream| {
+            if stream.is_remote_push
+                && (stream.is_pending_accept
+                    || (!stream.is_counted && !stream.state.is_closed()))
+            {
+                reserved += 1;
+            }
+        });
+        if reserved >= 1024 {
+            return Err(ProtoError::library_go_away(
+                Reason::ENHANCE_YOUR_CALM,
+            ));
+        }
+        let oversized = promise.is_over_size() || promise.is_malformed();
+        let (pseudo, fields) = promise.into_parts();
+        let valid_pseudo = pseudo
+            .authority
+            .as_ref()
+            .is_some_and(|a| !a.is_empty())
+            && pseudo.protocol.is_none();
+        let request = crate::message::frames_to_request(pseudo, fields, id);
+        let valid = !oversized
+            && valid_pseudo
+            && request.as_ref().is_ok_and(|r| {
+                frame::PushPromise::validate_request(r).is_ok()
+            });
+        let mut stream = Stream::new(
+            id,
+            self.actions.send.init_window_sz(),
+            self.actions.recv.init_window_sz(),
+        );
+        stream.state.reserve_remote()?;
+        stream.is_remote_push = true;
+        stream.streaming_recv = true;
+        if valid && !cancel {
+            let request = request.unwrap();
+            if request.method() == &header_plz::Method::HEAD {
+                stream.content_length = super::stream::ContentLength::Head;
+            }
+            stream.promised_request = Some(request);
+            let mut stream = self.store.insert(id, stream);
+            self.actions
+                .recv
+                .queue_push(&mut stream);
+        } else {
+            let stream = self.store.insert(id, stream);
+            let mut buffer = send_buffer.inner.lock().unwrap();
+            let actions = &mut self.actions;
+            self.counts
+                .transition(stream, |counts, stream| {
+                    actions.send.send_reset(
+                        if cancel {
+                            Reason::CANCEL
+                        } else {
+                            Reason::PROTOCOL_ERROR
+                        },
+                        Initiator::Library,
+                        stream,
+                        &mut buffer,
+                        counts,
+                        &mut actions.task,
+                    );
+                    actions
+                        .recv
+                        .enqueue_reset_expiration(stream, counts);
+                });
+        }
+        Ok(())
+    }
+
     // ===== Headers =====
     pub fn recv_headers(
         &mut self,
@@ -424,7 +542,11 @@ impl Inner {
         );
 
         self.store.for_each(|stream| {
-            if stream.id > last_stream_id {
+            // GOAWAY's cutoff refers only to streams initiated by us, not
+            // remotely initiated pushed responses that can finish draining.
+            if counts.role().is_local_init(stream.id)
+                && stream.id > last_stream_id
+            {
                 counts.transition(stream, |counts, stream| {
                     // notify receivers
                     actions
@@ -524,6 +646,9 @@ impl Inner {
                     .handle_error(send_buffer, stream, counts);
             })
         });
+        if counts.role().is_client() {
+            actions.clear_queues(true, &mut self.store, counts);
+        }
         actions.conn_error = Some(err);
         last_processed_id
     }
@@ -561,7 +686,11 @@ impl Inner {
         });
 
         // clear send and recv queues
-        actions.clear_queues(clear_pending_accept, &mut self.store, counts);
+        actions.clear_queues(
+            clear_pending_accept || counts.role().is_client(),
+            &mut self.store,
+            counts,
+        );
         Ok(())
     }
 

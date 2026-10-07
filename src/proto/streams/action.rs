@@ -36,9 +36,15 @@ pub struct Actions {
 
 impl Actions {
     pub fn new(role: Role, mut config: ConnectionConfig) -> Self {
+        let mut send = Send::new(&mut config);
+        send.next_stream_id = Ok(if role.is_server() {
+            2.into()
+        } else {
+            1.into()
+        });
         Actions {
             recv: Recv::new(&config, &role),
-            send: Send::new(&mut config),
+            send,
             task: None,
             conn_error: None,
         }

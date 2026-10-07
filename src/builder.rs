@@ -82,7 +82,11 @@ where
 {
     pub fn new() -> Self {
         let mut settings = frame::Settings::default();
-        settings.set_enable_push(false);
+        // This client does not accept pushed responses. Servers must not send
+        // SETTINGS_ENABLE_PUSH, which only controls server-to-client push.
+        if R::is_client() {
+            settings.set_enable_push(false);
+        }
         Builder {
             initial_connection_window_size: None,
             local_reset_stream_max: DEFAULT_RESET_STREAM_MAX,

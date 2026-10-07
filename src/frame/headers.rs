@@ -545,6 +545,10 @@ impl PushPromise {
         self.promised_id
     }
 
+    pub(crate) fn is_malformed(&self) -> bool {
+        self.header_block.malformed
+    }
+
     pub fn is_end_headers(&self) -> bool {
         self.flags.is_end_headers()
     }

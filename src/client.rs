@@ -29,6 +29,12 @@ pub struct Client {
 pub type ClientBuilder = Builder<Client>;
 
 impl ClientBuilder {
+    /// Opt in to receiving server push. Disabled by default.
+    pub fn enable_push(mut self, enabled: bool) -> Self {
+        self.settings.set_enable_push(enabled);
+        self
+    }
+
     pub fn single_packet_attack_mode(mut self, mode: Mode) -> Self {
         self.role.spa_mode = Some(mode);
         self
@@ -96,6 +102,50 @@ impl<T> ClientConnection<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Receives the next promised request, before its response is complete.
+    /// This drives the connection transport; do not concurrently poll the
+    /// connection as a Future (the two operations share a transport waker).
+    /// Continue polling after accepting a promise to drive its response.
+    /// Dropping the response future cancels the promised stream. The returned
+    /// body can be streamed or buffered by consuming its `BodyFrame`s.
+    /// Before using or caching a push, the caller must verify that the peer is
+    /// authoritative for its promised URI (or is an authorized proxy). Generic
+    /// transport IO does not expose TLS certificate/origin authorization here.
+    /// At most 1,024 pushes may be queued or remain reserved awaiting response
+    /// headers after acceptance; exceeding this bound yields ENHANCE_YOUR_CALM.
+    pub async fn push(
+        &mut self,
+    ) -> Option<Result<(Request, StreamingResponseFuture), OpError>> {
+        futures::future::poll_fn(|cx| self.poll_push(cx)).await
+    }
+
+    /// Polling counterpart of [`Self::push`]. Returns `None` on clean closure
+    /// and reports terminal connection errors as `Some(Err(...))`.
+    pub fn poll_push(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<(Request, StreamingResponseFuture), OpError>>>
+    {
+        let result = self.inner.poll(cx);
+        if let Poll::Ready(Err(err)) = result {
+            return Poll::Ready(Some(Err(err.into())));
+        }
+        if let Some((request, inner)) = self.inner.streams.next_push() {
+            return Poll::Ready(Some(Ok((
+                request,
+                StreamingResponseFuture {
+                    inner,
+                    handed_off: false,
+                },
+            ))));
+        }
+        if result.is_ready() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
+
     pub fn is_extended_connect_protocol_enabled(&self) -> bool {
         self.inner
             .is_extended_connect_protocol_enabled()

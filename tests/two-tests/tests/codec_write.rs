@@ -159,7 +159,8 @@ async fn server_settings_header_table_size() {
             0, 0x1, // id = SETTINGS_HEADER_TABLE_SIZE
             0, 0, 0, 0, // value = 0
         ])
-        .write(frames::NEW_SETTINGS)
+        // Servers must not advertise SETTINGS_ENABLE_PUSH.
+        .write(frames::SETTINGS)
         .write(frames::SETTINGS_ACK)
         .read(frames::SETTINGS_ACK)
         // Write GET /

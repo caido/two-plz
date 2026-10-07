@@ -191,6 +191,7 @@ fn decode_frame(
                 // Consume the whole block before resetting so the connection's
                 // HPACK table includes entries in later fragments.
                 Err(frame::Error::MalformedMessage) if !is_end_headers => {},
+                Err(frame::Error::MalformedMessage) if matches!(kind, Kind::PushPromise) => {},
                 Err(frame::Error::MalformedMessage) => {
                     let id = $head.stream_id();
                     proto_err!(stream: "malformed header block; stream={:?}", id);
@@ -392,6 +393,11 @@ fn decode_frame(
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_)))
                     if !is_end_headers => {}
                 Err(frame::Error::MalformedMessage) if !is_end_headers => {}
+                Err(frame::Error::MalformedMessage)
+                    if matches!(
+                        partial.frame,
+                        Continuable::PushPromise(_)
+                    ) => {}
                 Err(frame::Error::MalformedMessage) => {
                     let id = head.stream_id();
                     proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);

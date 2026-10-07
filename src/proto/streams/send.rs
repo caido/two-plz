@@ -68,6 +68,9 @@ pub struct Send {
     pending_open: Queue<stream::NextOpen>,
 
     is_push_enabled: bool,
+    // Promises are serialized in allocation order, before any promised response.
+    pending_push:
+        std::collections::VecDeque<(frame::PushPromise, super::store::Key)>,
     is_extended_connect_protocol_enabled: bool,
     peer_enabled_connect_protocol: bool,
     /// spa
@@ -95,7 +98,8 @@ impl Send {
             is_push_enabled: config
                 .peer_settings
                 .is_push_enabled()
-                .unwrap_or_default(),
+                .unwrap_or(true),
+            pending_push: std::collections::VecDeque::new(),
             is_extended_connect_protocol_enabled: config
                 .peer_settings
                 .is_extended_connect_protocol_enabled()
@@ -294,8 +298,6 @@ impl Send {
         if counts
             .role()
             .is_local_init(frame.stream_id())
-        // TODO(pp)
-        //&& !stream.is_pending_push
         {
             pending_open = true;
             self.pending_open.push(stream);
@@ -315,7 +317,32 @@ impl Send {
         Ok(())
     }
 
-    fn check_headers(fields: &HeaderMap) -> Result<(), UserError> {
+    pub fn ensure_push_enabled(&self) -> Result<(), UserError> {
+        if !self.is_push_enabled
+            || self.spa_tracker.is_some()
+            || self.max_stream_id != StreamId::MAX
+        {
+            return Err(UserError::Rejected);
+        }
+        Ok(())
+    }
+
+    pub fn queue_push(
+        &mut self,
+        promise: frame::PushPromise,
+        stream: &mut Ptr,
+        task: &mut Option<Waker>,
+    ) {
+        // Keep the slab entry reachable even if cancellation unlinks its ID.
+        stream.is_pending_push = true;
+        self.pending_push
+            .push_back((promise, stream.key()));
+        if let Some(task) = task.take() {
+            task.wake();
+        }
+    }
+
+    pub(super) fn check_headers(fields: &HeaderMap) -> Result<(), UserError> {
         // 8.1.2.2. Connection-Specific Header Fields
         if fields.has_key(const_headers::CONNECTION)
             || fields.has_key(const_headers::TRANSFER_ENCODING)
@@ -725,6 +752,11 @@ impl Send {
 
     /// ===== Clear =====
     pub fn clear_queues(&mut self, store: &mut Store, counts: &mut Counts) {
+        while let Some((_, key)) = self.pending_push.pop_front() {
+            let mut stream = store.resolve(key);
+            stream.is_pending_push = false;
+            counts.transition_after(stream, false);
+        }
         for (_, (_, task)) in self.flush_pending.drain() {
             if let Some(task) = task {
                 task.wake();
@@ -802,15 +834,41 @@ impl Send {
         store: &'s mut Store,
         counts: &mut Counts,
     ) -> Option<Ptr<'s>> {
-        // check for any pending open streams
-        if counts.can_inc_num_send_streams()
-            && let Some(mut stream) = self.pending_open.pop(store)
-        {
-            trace!("pop pending open| {:?}", stream.id);
-            counts.inc_num_send_streams(&mut stream);
-            self.notify_writer(stream.id);
-            return Some(stream);
+        // Resetting a reserved stream does not consume a concurrency slot.
+        // Only promised streams bypass the gate: a client request that was
+        // never opened cannot be reset on the wire.
+        if !counts.role().is_server() {
+            if counts.can_inc_num_send_streams() {
+                let mut stream = self.pending_open.pop(store)?;
+                counts.inc_num_send_streams(&mut stream);
+                self.notify_writer(stream.id);
+                return Some(stream);
+            }
+            return None;
         }
+        // Rotate the whole queue so a blocked response cannot hide a reset.
+        let mut blocked = Queue::<stream::NextOpen>::new();
+        while let Some(mut stream) = self.pending_open.pop(store) {
+            if stream.state.is_reset()
+                || stream.state.is_scheduled_reset()
+                || counts.can_inc_num_send_streams()
+            {
+                if !stream.state.is_reset()
+                    && !stream.state.is_scheduled_reset()
+                {
+                    counts.inc_num_send_streams(&mut stream);
+                }
+                let key = stream.key();
+                self.notify_writer(stream.id);
+                while let Some(mut waiting) = self.pending_open.pop(store) {
+                    blocked.push(&mut waiting);
+                }
+                self.pending_open = blocked;
+                return Some(store.resolve(key));
+            }
+            blocked.push(&mut stream);
+        }
+        self.pending_open = blocked;
         None
     }
 
@@ -1124,6 +1182,38 @@ impl Send {
         ready!(dst.poll_ready(cx))?;
         let max_frame_len = dst.max_send_frame_size();
         loop {
+            // Reserve every promised ID before opening responses, even when
+            // response handles were used in a different order.
+            if let Some((promise, key)) = self.pending_push.pop_front() {
+                store.resolve(key).is_pending_push = false;
+                let parent_reset = store
+                    .find_mut(&promise.stream_id())
+                    .is_none_or(|stream| {
+                        stream.state.is_reset()
+                            || stream.state.is_scheduled_reset()
+                    });
+                if !self.is_push_enabled || parent_reset {
+                    {
+                        let mut stream = store.resolve(key);
+                        // The peer has never seen this ID: close locally without
+                        // emitting RST_STREAM on an idle stream.
+                        let id = stream.id;
+                        stream.state.recv_reset(
+                            frame::Reset::new(id, Reason::CANCEL),
+                            true,
+                        );
+                        self.clear_stream_queue(buffer, &mut stream);
+                        if !stream.is_pending_open && !stream.is_pending_send {
+                            counts.transition_after(stream, false);
+                        }
+                    }
+                    continue;
+                }
+                dst.buffer(promise.into())
+                    .expect("invalid push promise");
+                ready!(dst.poll_ready(cx))?;
+                continue;
+            }
             if let Some(mut stream) = self.pop_pending_open(store, counts) {
                 self.pending_send
                     .push_front(&mut stream);

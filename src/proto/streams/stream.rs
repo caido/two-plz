@@ -42,6 +42,11 @@ pub(crate) struct Stream {
     /// Set to `true` when the stream is counted against the connection's max
     /// concurrent streams.
     pub is_counted: bool,
+    /// A promised HEAD request cannot have an outbound response body.
+    pub is_push_head: bool,
+    pub promised_request: Option<http_plz::Request>,
+    pub is_remote_push: bool,
+    pub is_pending_push: bool,
 
     // ===== Send =====
     pub send_flow: FlowControl,
@@ -108,6 +113,10 @@ impl Stream {
             state: State::default(),
             ref_count: 0,
             is_counted: false,
+            is_push_head: false,
+            promised_request: None,
+            is_remote_push: false,
+            is_pending_push: false,
             // === send ===
             send_flow: FlowControl::new(init_send_window),
             remaining_data_len: None,
@@ -186,7 +195,7 @@ impl Stream {
             self.ref_count == 0 &&
             // The stream is not in any queue
             // send queues
-            !self.is_pending_send && !self.is_pending_send_capacity && !self.is_pending_open &&
+            !self.is_pending_push && !self.is_pending_send && !self.is_pending_send_capacity && !self.is_pending_open &&
             // recv queues
             !self.is_pending_accept && !self.is_pending_complete
             && self.reset_at.is_none()

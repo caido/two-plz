@@ -170,7 +170,9 @@ where
             Frame::Priority(_) => Ok(()),
             Frame::Reset(reset) => self.streams.recv_reset(reset),
             Frame::Settings(settings) => self.recv_settings(settings),
-            Frame::PushPromise(_push_promise) => todo!(), // hyper
+            Frame::PushPromise(promise) => {
+                self.streams.recv_push_promise(promise)
+            }
             Frame::Ping(ping) => {
                 use PingAction::*;
                 match self.ping_handler.handle(ping) {
@@ -215,6 +217,9 @@ where
         &mut self,
         settings: Settings,
     ) -> Result<(), ProtoError> {
+        if self.role.is_client() && settings.is_push_enabled().is_some() {
+            return Err(ProtoError::library_go_away(Reason::PROTOCOL_ERROR));
+        }
         if let SettingsAction::ApplyLocal(local_settings) =
             self.settings_handler.recv(settings)?
         {
