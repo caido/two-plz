@@ -28,7 +28,7 @@ async fn send_data_without_requesting_capacity() {
     let payload = vec![0; 1024];
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         .write(&[
             // POST /
             0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75,

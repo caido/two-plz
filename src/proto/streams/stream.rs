@@ -74,9 +74,6 @@ pub(crate) struct Stream {
     pub content_length: ContentLength,
     /// Locally initiated CONNECT requests ignore content-length on 2xx responses.
     pub is_connect: bool,
-    /// When the RecvStream drop occurs, no data should be received.
-    /// TODO: why?
-    pub _is_recv: bool,
     /// Task tracking receiving frames
     pub recv_task: Option<Waker>,
 
@@ -138,7 +135,6 @@ impl Stream {
             recv_flow: FlowControl::new(init_recv_window),
             content_length: ContentLength::Omitted,
             is_connect: false,
-            _is_recv: true,
             recv_task: None,
             // next accept
             next_pending_accept: None,

@@ -436,7 +436,8 @@ impl Inner {
         let stream = match self.store.find_mut(&id) {
             Some(stream) => stream,
             None => {
-                // TODO(hyper): Are there other error cases?
+                // Store absence alone does not imply idle: validate ID history,
+                // then ignore resets for streams already known to be closed.
                 self.actions
                     .ensure_not_idle(self.counts.role(), id)
                     .map_err(ProtoError::library_go_away)?;
@@ -455,8 +456,7 @@ impl Inner {
                     .recv
                     .recv_reset(frame, stream, counts)?;
 
-                // clear stream queue
-                // reclaim capacity
+                // Clear the pending send queue and reclaim its capacity.
                 actions
                     .send
                     .handle_error(send_buffer, stream, counts);
@@ -639,8 +639,7 @@ impl Inner {
                 actions
                     .recv
                     .handle_error(&err, &mut *stream);
-                // TODO: should reclaim capacity ?
-                // clear pending buffer
+                // Clear the pending send buffer and release its queued capacity.
                 actions
                     .send
                     .handle_error(send_buffer, stream, counts);

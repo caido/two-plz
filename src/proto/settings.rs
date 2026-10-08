@@ -11,6 +11,44 @@ use crate::{
     proto::{self, ProtoError, streams::Streams},
 };
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_limits_are_applied_only_by_their_ack() {
+        let mut settings = Settings::default();
+        settings.set_header_table_size(Some(128));
+        let mut handler = SettingsHandler::new(settings);
+        assert!(matches!(
+            handler
+                .recv(Settings::default())
+                .unwrap(),
+            SettingsAction::Ok
+        ));
+        match handler.recv(Settings::ack()).unwrap() {
+            SettingsAction::ApplyLocal(local) => {
+                assert_eq!(local.header_table_size(), Some(128))
+            }
+            SettingsAction::Ok => panic!("local ACK must apply local limits"),
+        }
+        assert!(handler.recv(Settings::ack()).is_err());
+        // The current protocol serializes local SETTINGS. Model successive
+        // sends through the private waiting state to verify each ACK separately.
+        for limit in [0, 256, 64, 128] {
+            let mut local = Settings::default();
+            local.set_header_table_size(Some(limit));
+            handler.local = Local::WaitingAck(local);
+            match handler.recv(Settings::ack()).unwrap() {
+                SettingsAction::ApplyLocal(applied) => {
+                    assert_eq!(applied.header_table_size(), Some(limit))
+                }
+                SettingsAction::Ok => panic!("ACK lost its local settings"),
+            }
+        }
+    }
+}
+
 pub enum SettingsAction {
     /// send a SETTINGS ACK for remote SETTINGS
     Ok,

@@ -5,7 +5,7 @@ async fn recv_trailers_only() {
     support::trace_init!();
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         // Write GET /
         .write(&[
             0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29,

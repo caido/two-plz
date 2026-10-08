@@ -149,7 +149,7 @@ impl Table {
         }
 
         // If the header is already indexed by the static table, return that
-        if let Some((n, true)) = statik {
+        if let Some((n, true)) = statik.filter(|_| !header.is_sensitive()) {
             return Index::Indexed(n, header);
         }
 
@@ -234,9 +234,10 @@ impl Table {
             // Compute the real index into the VecDeque
             let real_idx = index.wrapping_add(self.inserted);
 
-            if self.slots[real_idx]
-                .header
-                .value_eq(&header)
+            if !header.is_sensitive()
+                && self.slots[real_idx]
+                    .header
+                    .value_eq(&header)
             {
                 // We have a full match!
                 return Index::Indexed(real_idx + DYN_OFFSET, header);
@@ -549,95 +550,253 @@ impl Table {
     }
 
     #[cfg(test)]
-    fn assert_valid_state(&self, _msg: &'static str) -> bool {
-        /*
-            // Checks that the internal map structure is valid
-            //
-            // Ensure all hash codes in indices match the associated slot
-            for pos in &self.indices {
-                if let Some(pos) = *pos {
-                    let real_idx = pos.index.wrapping_add(self.inserted);
+    fn assert_valid_state(&self, msg: &'static str) -> bool {
+        // Internal callers may have charged the next insertion's bytes and may
+        // retain a root for that not-yet-inserted slot during eviction.
+        self.assert_structure(msg, false)
+    }
 
-                    if real_idx.wrapping_add(1) != 0 {
-                        assert!(real_idx < self.slots.len(),
-                                "out of index; real={}; len={}, msg={}",
-                                real_idx, self.slots.len(), msg);
+    #[cfg(test)]
+    fn assert_structure(&self, msg: &'static str, complete: bool) -> bool {
+        let raw = self.indices.len();
+        if raw == 0 {
+            assert_eq!(self.mask, 0, "{msg}: empty mask");
+            assert!(self.slots.is_empty(), "{msg}: slots without buckets");
+        } else {
+            assert!(raw.is_power_of_two(), "{msg}: bucket count");
+            assert_eq!(self.mask, raw - 1, "{msg}: mask");
+            assert!(
+                self.indices.iter().any(Option::is_none),
+                "{msg}: full map"
+            );
+        }
+        assert!(self.slots.len() <= self.capacity(), "{msg}: capacity");
+        let bytes = self
+            .slots
+            .iter()
+            .try_fold(0usize, |n, slot| {
+                assert_eq!(
+                    slot.hash,
+                    hash_header(&slot.header),
+                    "{msg}: slot hash"
+                );
+                n.checked_add(slot.header.len())
+            })
+            .expect("live byte size overflow");
+        if complete {
+            assert_eq!(bytes, self.size, "{msg}: byte accounting");
+            assert!(self.size <= self.max_size, "{msg}: size limit");
+        } else {
+            assert!(bytes <= self.size, "{msg}: precharged byte accounting");
+        }
 
-                        assert_eq!(pos.hash, self.slots[real_idx].hash,
-                                   "index hash does not match slot; msg={}", msg);
-                    }
-                }
+        let mut reached = vec![false; self.slots.len()];
+        let mut roots: Vec<usize> = Vec::new();
+        let mut pending = false;
+        for (bucket, pos) in self.indices.iter().enumerate() {
+            let Some(pos) = *pos else {
+                continue;
+            };
+            let root = pos.index.wrapping_add(self.inserted);
+            // Check lookup reachability with a finite probe bound, rather than
+            // using probe_loop!, which cannot terminate on a corrupt map.
+            let desired = desired_pos(self.mask, pos.hash);
+            let distance = probe_distance(self.mask, pos.hash, bucket);
+            for dist in 0..=distance {
+                let probe = desired.wrapping_add(dist) & self.mask;
+                let occupant =
+                    self.indices[probe].expect("hole in probe path");
+                assert!(
+                    probe_distance(self.mask, occupant.hash, probe) >= dist,
+                    "{msg}: lookup stops before root"
+                );
             }
-
-            // Every index is only available once
-            for i in 0..self.indices.len() {
-                if self.indices[i].is_none() {
-                    continue;
-                }
-
-                for j in i+1..self.indices.len() {
-                    assert_ne!(self.indices[i], self.indices[j],
-                                "duplicate indices; msg={}", msg);
-                }
+            if !complete && root == usize::MAX {
+                assert!(!pending, "{msg}: duplicate pending root");
+                pending = true;
+                continue;
             }
-
-            for (index, slot) in self.slots.iter().enumerate() {
-                let mut indexed = None;
-
-                // First, see if the slot is indexed
-                for (i, pos) in self.indices.iter().enumerate() {
-                    if let Some(pos) = *pos {
-                        let real_idx = pos.index.wrapping_add(self.inserted);
-                        if real_idx == index {
-                            indexed = Some(i);
-                            // Already know that there is no dup, so break
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(actual) = indexed {
-                    // Ensure that it is accessible..
-                    let desired = desired_pos(self.mask, slot.hash);
-                    let mut probe = desired;
-                    let mut dist = 0;
-
-                    probe_loop!(probe < self.indices.len(), {
-                        assert!(self.indices[probe].is_some(),
-                                "unexpected empty slot; probe={}; hash={:?}; msg={}",
-                                probe, slot.hash, msg);
-
-                        let pos = self.indices[probe].unwrap();
-
-                        let their_dist = probe_distance(self.mask, pos.hash, probe);
-                        let real_idx = pos.index.wrapping_add(self.inserted);
-
-                        if real_idx == index {
-                            break;
-                        }
-
-                        assert!(dist <= their_dist,
-                                "could not find entry; actual={}; desired={}" +
-                                "probe={}, dist={}; their_dist={}; index={}; msg={}",
-                                actual, desired, probe, dist, their_dist,
-                                index.wrapping_sub(self.inserted), msg);
-
-                        dist += 1;
-                    });
-                } else {
-                    // There is exactly one next link
-                    let cnt = self.slots.iter().map(|s| s.next)
-                        .filter(|n| *n == Some(index.wrapping_sub(self.inserted)))
-                        .count();
-
-                    assert_eq!(1, cnt, "more than one node pointing here; msg={}", msg);
-                }
+            assert!(root < self.slots.len(), "{msg}: root outside live slots");
+            assert_eq!(pos.hash, self.slots[root].hash, "{msg}: root hash");
+            for &other in &roots {
+                assert!(
+                    self.slots[other].header.name()
+                        != self.slots[root].header.name(),
+                    "{msg}: duplicate name roots"
+                );
             }
-        */
-
-        // TODO(hyper): Ensure linked lists are correct: no cycles, etc...
-
+            roots.push(root);
+            let mut current = Some(root);
+            for _ in 0..self.slots.len() {
+                let Some(index) = current else {
+                    break;
+                };
+                assert!(
+                    index < self.slots.len(),
+                    "{msg}: link outside live slots"
+                );
+                assert!(!reached[index], "{msg}: cycle or shared node");
+                reached[index] = true;
+                let slot = &self.slots[index];
+                assert_eq!(slot.hash, pos.hash, "{msg}: chain hash");
+                assert!(
+                    slot.header.name() == self.slots[root].header.name(),
+                    "{msg}: mixed names in chain"
+                );
+                current = slot.next.map(|next| {
+                    let next = next.wrapping_add(self.inserted);
+                    assert!(
+                        next < index,
+                        "{msg}: chain must run oldest to newest"
+                    );
+                    next
+                });
+            }
+            assert!(current.is_none(), "{msg}: chain exceeds live slot count");
+        }
+        assert!(
+            reached.into_iter().all(|seen| seen),
+            "{msg}: unreachable slot"
+        );
         true
+    }
+}
+
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+    use bytes::Bytes;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    fn field(name: &str, value: &str) -> Header {
+        Header::Field {
+            name: Bytes::copy_from_slice(name.as_bytes()),
+            value: Bytes::copy_from_slice(value.as_bytes()),
+        }
+    }
+
+    fn insert_checked(table: &mut Table, name: &str, value: &str) {
+        let header = field(name, value);
+        let result = table.index(header.clone());
+        assert!(table.resolve(&result).name() == header.name());
+        assert!(table.resolve(&result).value_eq(&header));
+        assert!(table.assert_structure("completed insertion", true));
+        if !matches!(result, Index::NotIndexed(_)) {
+            let index = table.resolve_idx(&result);
+            if index >= DYN_OFFSET {
+                let slot = &table.slots[index - DYN_OFFSET];
+                assert!(slot.header.name() == header.name());
+                if !matches!(result, Index::Name(..)) {
+                    assert!(slot.header.value_eq(&header));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_table_operations() {
+        for seed in [0, 1, 0x4850_4143_4b, u64::MAX] {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut table = Table::new(4096, 0);
+            for _ in 0..2000 {
+                if rng.random_range(0..5) == 0 {
+                    let limits = [0, 1, 40, 80, 128, 256, 1024, 4096];
+                    table.resize(limits[rng.random_range(0..limits.len())]);
+                    assert!(table.assert_structure("completed resize", true));
+                } else {
+                    let name = format!("x-name-{}", rng.random_range(0..24));
+                    let value = format!(
+                        "{}-{}",
+                        rng.random_range(0..12),
+                        "v".repeat(rng.random_range(0..96))
+                    );
+                    insert_checked(&mut table, &name, &value);
+                    let before =
+                        (table.size, table.slots.len(), table.inserted);
+                    insert_checked(&mut table, &name, &value);
+                    assert_eq!(
+                        before,
+                        (table.size, table.slots.len(), table.inserted),
+                        "repeated lookup must not insert"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collision_growth_eviction_and_counter_wrap() {
+        let mut table = Table::new(8192, 0);
+        table.inserted = usize::MAX - 2;
+        let names: Vec<_> = (0..10000)
+            .map(|n| format!("x-collision-{n}"))
+            .filter(|name| hash_header(&field(name, "v")).0 & 7 == 7)
+            .take(40)
+            .collect();
+        assert_eq!(names.len(), 40);
+        for name in &names {
+            insert_checked(&mut table, name, "first");
+        }
+        assert!(table.inserted < 40, "insertion counter did not wrap");
+        assert!(table.indices.len() > 8, "hash storage did not grow");
+        for value in ["second", "third", "fourth"] {
+            for name in &names {
+                insert_checked(&mut table, name, value);
+            }
+        }
+        for limit in [4096, 1024, 128, 40, 0, 8192] {
+            table.resize(limit);
+            assert!(table.assert_structure("eviction and resize", true));
+        }
+        insert_checked(&mut table, &names[0], "after clearing");
+    }
+
+    #[test]
+    fn checker_rejects_corruption_without_unbounded_walks() {
+        for corruption in 0..6 {
+            let mut table = Table::new(4096, 0);
+            insert_checked(&mut table, "x-chain", "one");
+            insert_checked(&mut table, "x-chain", "two");
+            let bucket = table
+                .indices
+                .iter()
+                .position(Option::is_some)
+                .unwrap();
+            match corruption {
+                0 => table.size += 1,
+                1 => {
+                    table.slots[1].next =
+                        Some(1usize.wrapping_sub(table.inserted))
+                }
+                2 => {
+                    table.slots[1].next =
+                        Some(100usize.wrapping_sub(table.inserted))
+                }
+                3 => {
+                    table.indices[bucket]
+                        .as_mut()
+                        .unwrap()
+                        .hash = HashValue(0)
+                }
+                4 => table.indices[bucket] = None,
+                5 => {
+                    let empty = table
+                        .indices
+                        .iter()
+                        .position(Option::is_none)
+                        .unwrap();
+                    table.indices[empty] = table.indices[bucket];
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                std::panic::catch_unwind(|| {
+                    table.assert_structure("deliberate corruption", true);
+                })
+                .is_err(),
+                "corruption {corruption} went undetected"
+            );
+        }
     }
 }
 
@@ -658,7 +817,8 @@ impl Index {
     fn new(v: Option<(usize, bool)>, e: Header) -> Index {
         match v {
             None => Index::NotIndexed(e),
-            Some((n, true)) => Index::Indexed(n, e),
+            Some((n, true)) if !e.is_sensitive() => Index::Indexed(n, e),
+            Some((n, true)) => Index::Name(n, e),
             Some((n, false)) => Index::Name(n, e),
         }
     }
@@ -696,13 +856,14 @@ fn hash_header(header: &Header) -> HashValue {
 /// boolean representing if the value matched as well.
 fn index_static(header: &Header) -> Option<(usize, bool)> {
     match *header {
+        Header::Sensitive(ref header) => index_static(header),
         Header::Field {
             ref name,
             ref value,
         } => match name.as_ref() {
             header::ACCEPT_CHARSET => Some((15, false)),
             header::ACCEPT_ENCODING => {
-                if *value == "gzip, deflate" {
+                if value.as_ref() == b"gzip, deflate" {
                     Some((16, true))
                 } else {
                     Some((16, false))

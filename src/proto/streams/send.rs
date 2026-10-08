@@ -53,8 +53,7 @@ pub struct Send {
     /// > the identified last stream.
     max_stream_id: StreamId,
 
-    // TODO: make this configurable
-    // hyper Builder::StreamId
+    // Test-only configuration can override the role's initial stream ID.
     /// Stream identifier to use for next initialized stream.
     pub next_stream_id: Result<StreamId, StreamIdOverflow>,
 
@@ -371,6 +370,7 @@ impl Send {
         counts: &mut Counts,
         task: &mut Option<Waker>,
     ) {
+        self.remove_spa_stream(stream);
         let is_reset = stream.state.is_reset();
         let is_closed = stream.state.is_closed();
         let is_empty = stream.pending_send.is_empty();
@@ -409,6 +409,7 @@ impl Send {
         task: &mut Option<Waker>,
     ) {
         trace!("scheduled reset| {:?}", stream.id);
+        self.remove_spa_stream(stream);
         if stream.state.is_closed() {
             // Stream is already closed, nothing more to do
             return;
@@ -696,7 +697,8 @@ impl Send {
         stream: &mut Ptr<'_>,
         counts: &mut Counts,
     ) {
-        let allocated = stream.connection_window_allocated;
+        let allocated =
+            std::mem::take(&mut stream.connection_window_allocated);
         if allocated > 0 {
             let _ = self.recv_connection_window_update(
                 allocated,
@@ -817,6 +819,7 @@ impl Send {
         buffer: &mut Buffer<Frame<Bytes>>,
         stream: &mut Ptr,
     ) {
+        self.remove_spa_stream(stream);
         self.notify_writer(stream.id);
         self.streaming.remove(&stream.id);
         self.flush_pending.remove(&stream.id);
@@ -1245,6 +1248,17 @@ impl Send {
             && self.pending_open.is_empty()
     }
 
+    fn remove_spa_stream(&mut self, stream: &mut Ptr) {
+        if self
+            .spa_tracker
+            .as_mut()
+            .is_some_and(|spa| spa.remove_stream(stream.id))
+        {
+            // Reclaim through the ordinary allocator so waiting siblings resume.
+            stream.connection_window_allocated += 1;
+        }
+    }
+
     pub fn spa_recv_window_update(&mut self, stream_id: StreamId) {
         if let Some(spa) = self.spa_tracker.as_mut() {
             spa.remove_pending_stream_update(stream_id);
@@ -1276,11 +1290,53 @@ impl Send {
             return Poll::Ready(Ok(()));
         }
 
-        // TODO: wait for connection window update ?
-        //if self.flow.available() < size as u32 {
-        //    error!("not enough stream flow control");
-        //}
-        //
+        // Capacity allocation can schedule a one-byte stream again after its
+        // HEADERS already queued it for SPA. Hand each final DATA frame off once.
+        spa_tracker.pending_spa.sort();
+        spa_tracker.pending_spa.dedup();
+
+        // The final SPA bytes bypass pop_data_frame, so reserve their credit
+        // here before the tracker can hand DATA to the codec. Check the whole
+        // batch first; a blocked batch must not consume partial credit.
+        let mut needed = 0;
+        for id in &spa_tracker.pending_spa {
+            let stream = store
+                .find_mut(id)
+                .expect("pending SPA stream");
+            if stream.remaining_data_len == Some(1) {
+                if stream.send_flow.available() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                if stream.connection_window_allocated == 0 {
+                    needed += 1;
+                }
+            }
+        }
+        if needed > self.flow.available() {
+            return Poll::Ready(Ok(()));
+        }
+        for id in &spa_tracker.pending_spa {
+            let mut stream = store
+                .find_mut(id)
+                .expect("pending SPA stream");
+            if stream.remaining_data_len == Some(1) {
+                if stream.connection_window_allocated == 0 {
+                    self.flow
+                        .dec_window(1)
+                        .expect("checked SPA connection credit");
+                } else {
+                    stream.connection_window_allocated -= 1;
+                }
+                stream
+                    .send_flow
+                    .dec_window(1)
+                    .expect("checked SPA stream credit");
+                // Keep the reservation refundable until handoff, but do not
+                // charge it again while synchronization/transport is pending.
+                spa_tracker.reserved_streams.push(*id);
+                stream.remaining_data_len = None;
+            }
+        }
 
         let mut is_done = false;
         let poll_result = spa_tracker.poll(
@@ -1325,6 +1381,8 @@ mod tests {
 
     fn sender() -> Send {
         Send::new(&mut ConnectionConfig {
+            #[cfg(feature = "test-util")]
+            initial_stream_id: StreamId::from(1),
             initial_connection_window_size: None,
             local_max_error_reset_streams: None,
             local_reset_stream_max: 0,
@@ -1335,6 +1393,563 @@ mod tests {
             max_recv_buffer_size: 0,
             spa_tracker: None,
         })
+    }
+
+    #[test]
+    fn pending_open_keeps_order_around_cancelled_reservation() {
+        let mut send = sender();
+        let mut counts = super::super::counts::tests::single_slot(
+            crate::role::Role::Server,
+        );
+        let mut store = Store::new();
+        for id in [2, 4, 6] {
+            let id = StreamId::from(id);
+            let mut stream = stream::Stream::new(id, 10, 10);
+            stream.state.reserve_local().unwrap();
+            if u32::from(id) == 4 {
+                stream
+                    .state
+                    .set_scheduled_reset(Reason::CANCEL);
+            }
+            let mut stream = store.insert(id, stream);
+            send.pending_open.push(&mut stream);
+        }
+        let first = send
+            .pop_pending_open(&mut store, &mut counts)
+            .unwrap();
+        assert_eq!(u32::from(first.id), 2);
+        assert!(first.is_counted);
+        drop(first);
+        let cancelled = send
+            .pop_pending_open(&mut store, &mut counts)
+            .unwrap();
+        assert_eq!(u32::from(cancelled.id), 4);
+        assert!(!cancelled.is_counted);
+        counts.transition(cancelled, |_, stream| {
+            let id = stream.id;
+            stream
+                .state
+                .recv_reset(frame::Reset::new(id, Reason::CANCEL), true);
+        });
+        for _ in 0..8 {
+            assert!(
+                send.pop_pending_open(&mut store, &mut counts)
+                    .is_none()
+            );
+        }
+        let first = store
+            .find_mut(&StreamId::from(2))
+            .unwrap();
+        counts.transition(first, |_, stream| stream.state.recv_eof());
+        let last = send
+            .pop_pending_open(&mut store, &mut counts)
+            .unwrap();
+        assert_eq!(u32::from(last.id), 6);
+        counts.transition(last, |_, stream| stream.state.recv_eof());
+        assert!(!counts.has_streams());
+    }
+
+    #[derive(Default)]
+    struct PendingSpaIo {
+        bytes: Vec<u8>,
+        block_write: bool,
+        block_flush: bool,
+        fail_flush: bool,
+        task: Option<Waker>,
+    }
+
+    impl tokio::io::AsyncRead for PendingSpaIo {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingSpaIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.block_write {
+                self.task = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            self.bytes.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.fail_flush {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            if self.block_flush {
+                self.task = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn spa_pending_transport_hands_off_once_and_resumes_exact_credit() {
+        use crate::spa::{Mode, PingState};
+        // Synchronization has completed before the transport handoff in these modes.
+        for mode in [
+            Mode::Native,
+            Mode::Ping(Some(([0; 8], true))),
+            Mode::EnhancedPing(PingState::Fin, None),
+        ] {
+            for allocated in [false, true] {
+                for fail in [false, true] {
+                    let mut send = sender();
+                    let mut tracker =
+                        crate::spa::SpaTracker::from(mode.clone());
+                    let id = StreamId::from(1);
+                    tracker.add_pending_spa(id);
+                    tracker.add_pending_spa(id);
+                    send.spa_tracker = Some(tracker);
+                    send.flow = FlowControl::new(0);
+                    let mut buffer = Buffer::new();
+                    let mut store = Store::new();
+                    let mut stream = stream::Stream::new(id, 1, 1);
+                    stream.state.send_open(false).unwrap();
+                    stream.remaining_data_len = Some(1);
+                    stream.pending_send.push_back(
+                        &mut buffer,
+                        frame::Data::new(id, Bytes::from_static(b"x")).into(),
+                    );
+                    drop(store.insert(id, stream));
+                    let mut dst = Codec::new(PendingSpaIo {
+                        block_write: true,
+                        block_flush: true,
+                        ..Default::default()
+                    });
+                    let mut ping = PingHandler::new();
+                    let wakes = Arc::new(WakeCount::default());
+                    let waker = Waker::from(wakes.clone());
+                    let mut cx = Context::from_waker(&waker);
+                    assert!(matches!(
+                        send.poll_spa(
+                            &mut cx,
+                            &mut buffer,
+                            &mut store,
+                            &mut dst,
+                            &mut ping
+                        ),
+                        Poll::Ready(Ok(()))
+                    ));
+                    assert!(dst.get_mut().bytes.is_empty());
+                    assert_eq!(
+                        store
+                            .find_mut(&id)
+                            .unwrap()
+                            .remaining_data_len,
+                        Some(1)
+                    );
+                    if allocated {
+                        store
+                            .find_mut(&id)
+                            .unwrap()
+                            .connection_window_allocated = 1;
+                    } else {
+                        send.flow.inc_window(1).unwrap();
+                    }
+                    for _ in 0..3 {
+                        assert!(
+                            send.poll_spa(
+                                &mut cx,
+                                &mut buffer,
+                                &mut store,
+                                &mut dst,
+                                &mut ping
+                            )
+                            .is_pending()
+                        );
+                        assert_eq!(send.flow.available(), 0);
+                        let stream = store.find_mut(&id).unwrap();
+                        assert_eq!(stream.send_flow.available(), 0);
+                        assert_eq!(stream.connection_window_allocated, 0);
+                        assert_eq!(stream.remaining_data_len, None);
+                        assert!(stream.pending_send.is_empty());
+                    }
+                    dst.get_mut().block_write = false;
+                    dst.get_mut()
+                        .task
+                        .take()
+                        .unwrap()
+                        .wake();
+                    assert_eq!(wakes.0.load(AtomicOrdering::SeqCst), 1);
+                    for _ in 0..3 {
+                        assert!(
+                            send.poll_spa(
+                                &mut cx,
+                                &mut buffer,
+                                &mut store,
+                                &mut dst,
+                                &mut ping
+                            )
+                            .is_pending()
+                        );
+                        assert_eq!(send.flow.available(), 0);
+                        assert_eq!(
+                            store
+                                .find_mut(&id)
+                                .unwrap()
+                                .send_flow
+                                .available(),
+                            0
+                        );
+                    }
+                    assert_eq!(
+                        dst.get_mut().bytes,
+                        [0, 0, 1, 0, 1, 0, 0, 0, 1, b'x']
+                    );
+                    dst.get_mut().block_flush = false;
+                    dst.get_mut().fail_flush = fail;
+                    dst.get_mut()
+                        .task
+                        .take()
+                        .unwrap()
+                        .wake();
+                    assert_eq!(wakes.0.load(AtomicOrdering::SeqCst), 2);
+                    match send.poll_spa(
+                        &mut cx,
+                        &mut buffer,
+                        &mut store,
+                        &mut dst,
+                        &mut ping,
+                    ) {
+                        Poll::Ready(Err(error)) if fail => {
+                            assert_eq!(
+                                error.kind(),
+                                io::ErrorKind::BrokenPipe
+                            );
+                            assert!(send.spa_tracker.is_some());
+                        }
+                        Poll::Ready(Ok(())) if !fail => {
+                            assert!(send.spa_tracker.is_none())
+                        }
+                        result => {
+                            panic!("unexpected SPA completion: {result:?}")
+                        }
+                    }
+                    assert_eq!(send.flow.available(), 0);
+                    assert_eq!(dst.get_mut().bytes.len(), 10);
+                    store.for_each(|mut stream| {
+                        stream.unlink();
+                        stream.remove();
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spa_cancellation_prunes_waits_and_preserves_sibling() {
+        use crate::spa::{Mode, PingState};
+        for mode in [
+            Mode::Native,
+            Mode::Ping(Some(([7; 8], false))),
+            Mode::EnhancedPing(PingState::SecondSent, Some([7; 8])),
+        ] {
+            for wait in 0..3 {
+                if wait == 2 && matches!(mode, Mode::Native) {
+                    continue;
+                }
+                for local_drop in [false, true] {
+                    let mut send = sender();
+                    let mut counts = super::super::counts::tests::single_slot(
+                        crate::role::Role::Client,
+                    );
+                    let mut store = Store::new();
+                    let mut buffer = Buffer::new();
+                    let cancelled = StreamId::from(1);
+                    let sibling = StreamId::from(3);
+                    let mut tracker =
+                        crate::spa::SpaTracker::from(mode.clone());
+                    for id in [cancelled, sibling] {
+                        let mut stream = stream::Stream::new(
+                            id,
+                            if wait == 1 && id == cancelled {
+                                0
+                            } else {
+                                1
+                            },
+                            1,
+                        );
+                        stream.state.send_open(false).unwrap();
+                        stream.remaining_data_len = Some(1);
+                        stream.pending_send.push_back(
+                            &mut buffer,
+                            frame::Data::new(id, Bytes::from_static(b"x"))
+                                .into(),
+                        );
+                        drop(store.insert(id, stream));
+                        tracker.add_pending_spa(id);
+                    }
+                    tracker.add_pending_spa(cancelled);
+                    if wait == 1 {
+                        tracker.add_pending_stream_update(cancelled);
+                        tracker.add_pending_stream_update(cancelled);
+                    }
+                    send.spa_tracker = Some(tracker);
+                    send.flow = FlowControl::new(if wait == 0 {
+                        0
+                    } else {
+                        2
+                    });
+                    let mut dst = Codec::new(PendingSpaIo::default());
+                    let mut ping = PingHandler::new();
+                    let waker = Waker::noop();
+                    let mut cx = Context::from_waker(waker);
+                    let before = send.poll_spa(
+                        &mut cx,
+                        &mut buffer,
+                        &mut store,
+                        &mut dst,
+                        &mut ping,
+                    );
+                    assert!(
+                        before.is_pending()
+                            || matches!(before, Poll::Ready(Ok(())))
+                    );
+                    assert!(dst.get_mut().bytes.is_empty());
+                    let mut task = None;
+                    {
+                        let mut stream = store.find_mut(&cancelled).unwrap();
+                        if local_drop {
+                            send.schedule_implicit_reset(
+                                &mut stream,
+                                Reason::CANCEL,
+                                &mut counts,
+                                &mut task,
+                            );
+                        } else {
+                            stream.state.recv_reset(
+                                frame::Reset::new(cancelled, Reason::CANCEL),
+                                true,
+                            );
+                            send.handle_error(
+                                &mut buffer,
+                                &mut stream,
+                                &mut counts,
+                            );
+                        }
+                    }
+                    let tracker = send.spa_tracker.as_ref().unwrap();
+                    assert!(
+                        !tracker.pending_spa.contains(&cancelled),
+                        "cancelled SPA ID survived cleanup"
+                    );
+                    assert!(
+                        !tracker.are_pending_stream_window_update(),
+                        "cancelled stream still gates siblings"
+                    );
+                    // The scheduled-drop path must still send its reset normally.
+                    assert!(matches!(
+                        send.poll_complete(
+                            &mut cx,
+                            &mut buffer,
+                            &mut store,
+                            &mut counts,
+                            &mut dst
+                        ),
+                        Poll::Ready(Ok(()))
+                    ));
+                    for _ in 0..2 {
+                        if let Some(mut stream) = store.find_mut(&cancelled) {
+                            send.handle_error(
+                                &mut buffer,
+                                &mut stream,
+                                &mut counts,
+                            );
+                        }
+                    }
+                    if let Some(mut stream) = store.find_mut(&cancelled) {
+                        stream.unlink();
+                        stream.remove();
+                    }
+                    if wait == 0 {
+                        send.flow.inc_window(1).unwrap();
+                    }
+                    if !matches!(mode, Mode::Native) {
+                        assert!(
+                            send.poll_spa(
+                                &mut cx,
+                                &mut buffer,
+                                &mut store,
+                                &mut dst,
+                                &mut ping
+                            )
+                            .is_pending()
+                        );
+                        send.recvd_ping(&[7; 8], &mut cx);
+                    }
+                    assert!(matches!(
+                        send.poll_spa(
+                            &mut cx,
+                            &mut buffer,
+                            &mut store,
+                            &mut dst,
+                            &mut ping
+                        ),
+                        Poll::Ready(Ok(()))
+                    ));
+                    assert!(send.spa_tracker.is_none());
+                    assert_eq!(
+                        send.flow.available(),
+                        if wait == 0 {
+                            0
+                        } else {
+                            1
+                        }
+                    );
+                    assert_eq!(
+                        &dst.get_mut().bytes[if local_drop {
+                            13
+                        } else {
+                            0
+                        }..],
+                        &[0, 0, 1, 0, 1, 0, 0, 0, 3, b'x']
+                    );
+                    assert_eq!(
+                        store
+                            .find_mut(&sibling)
+                            .unwrap()
+                            .send_flow
+                            .available(),
+                        0
+                    );
+                    store.for_each(|mut stream| {
+                        stream.unlink();
+                        stream.remove();
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spa_cancellation_reclaims_allocated_credit_once() {
+        let mut send = sender();
+        let mut counts = super::super::counts::tests::single_slot(
+            crate::role::Role::Client,
+        );
+        let mut store = Store::new();
+        let mut buffer = Buffer::new();
+        let id = StreamId::from(1);
+        let mut stream = stream::Stream::new(id, 1, 1);
+        stream.connection_window_allocated = 1;
+        stream.state.send_open(false).unwrap();
+        stream
+            .state
+            .recv_reset(frame::Reset::new(id, Reason::CANCEL), true);
+        send.flow = FlowControl::new(0);
+        let mut stream = store.insert(id, stream);
+        for _ in 0..3 {
+            send.handle_error(&mut buffer, &mut stream, &mut counts);
+            assert_eq!(send.flow.available(), 1);
+            assert_eq!(stream.connection_window_allocated, 0);
+        }
+        stream.unlink();
+        stream.remove();
+    }
+
+    #[test]
+    fn spa_cancellation_after_handoff_preserves_pending_flush() {
+        use crate::spa::{Mode, PingState};
+        for mode in [
+            Mode::Native,
+            Mode::Ping(Some(([0; 8], true))),
+            Mode::EnhancedPing(PingState::Fin, None),
+        ] {
+            let mut send = sender();
+            let mut counts = super::super::counts::tests::single_slot(
+                crate::role::Role::Client,
+            );
+            let mut store = Store::new();
+            let mut buffer = Buffer::new();
+            let id = StreamId::from(1);
+            let mut stream = stream::Stream::new(id, 1, 1);
+            stream.state.send_open(false).unwrap();
+            stream.remaining_data_len = Some(1);
+            stream.pending_send.push_back(
+                &mut buffer,
+                frame::Data::new(id, Bytes::from_static(b"x")).into(),
+            );
+            drop(store.insert(id, stream));
+            let mut tracker = crate::spa::SpaTracker::from(mode);
+            tracker.add_pending_spa(id);
+            send.spa_tracker = Some(tracker);
+            send.flow = FlowControl::new(1);
+            let mut dst = Codec::new(PendingSpaIo {
+                block_flush: true,
+                ..Default::default()
+            });
+            let mut ping = PingHandler::new();
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(
+                send.poll_spa(
+                    &mut cx,
+                    &mut buffer,
+                    &mut store,
+                    &mut dst,
+                    &mut ping
+                )
+                .is_pending()
+            );
+            {
+                let mut stream = store.find_mut(&id).unwrap();
+                stream
+                    .state
+                    .recv_reset(frame::Reset::new(id, Reason::CANCEL), true);
+                send.handle_error(&mut buffer, &mut stream, &mut counts);
+                send.handle_error(&mut buffer, &mut stream, &mut counts);
+                stream.unlink();
+                stream.remove();
+            }
+            for _ in 0..3 {
+                assert!(
+                    send.poll_spa(
+                        &mut cx,
+                        &mut buffer,
+                        &mut store,
+                        &mut dst,
+                        &mut ping
+                    )
+                    .is_pending()
+                );
+                assert_eq!(send.flow.available(), 0);
+            }
+            dst.get_mut().block_flush = false;
+            assert!(matches!(
+                send.poll_spa(
+                    &mut cx,
+                    &mut buffer,
+                    &mut store,
+                    &mut dst,
+                    &mut ping
+                ),
+                Poll::Ready(Ok(()))
+            ));
+            assert!(send.spa_tracker.is_none());
+            assert_eq!(dst.get_mut().bytes, [0, 0, 1, 0, 1, 0, 0, 0, 1, b'x']);
+        }
     }
 
     #[test]

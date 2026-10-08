@@ -27,6 +27,55 @@ pub struct Store {
     ids: IndexMap<StreamId, SlabIndex>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iteration_visits_every_entry_when_current_entries_are_removed() {
+        for remove_all in [false, true] {
+            let mut store = Store::new();
+            for id in (1..20).step_by(2) {
+                store.insert(
+                    StreamId::from(id),
+                    Stream::new(StreamId::from(id), 10, 10),
+                );
+            }
+            let mut visited = Vec::new();
+            store.for_each(|mut stream| {
+                visited.push(stream.id);
+                if remove_all || u32::from(stream.id) % 4 == 1 {
+                    stream.unlink();
+                    stream.remove();
+                }
+            });
+            visited.sort();
+            assert_eq!(
+                visited,
+                (1..20)
+                    .step_by(2)
+                    .map(StreamId::from)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                store.num_wired_streams(),
+                if remove_all {
+                    0
+                } else {
+                    5
+                }
+            );
+            // Release survivors after checking partial removal; test-util also
+            // checks that the store owns no stream state when it is dropped.
+            store.for_each(|mut stream| {
+                stream.unlink();
+                stream.remove();
+            });
+            assert_eq!(store.num_wired_streams(), 0);
+        }
+    }
+}
+
 impl Store {
     pub fn new() -> Self {
         Store {

@@ -11,6 +11,7 @@ use header_plz::StatusCode;
 use header_plz::const_headers::*;
 use header_plz::message_head::header_map::Hmap;
 use header_plz::{Header, HeaderMap};
+use header_plz::{RequestPseudoHeader, RequestSensitivity};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -78,6 +79,8 @@ pub struct Pseudo {
 
     // Response
     pub status: Option<StatusCode>,
+    pub sensitivity: RequestSensitivity,
+    pub status_sensitive: bool,
 }
 
 #[derive(Debug)]
@@ -207,10 +210,6 @@ impl Headers {
             }
             let stream_dep = StreamDependency::load(&src[..5])?;
 
-            if stream_dep.dependency_id() == head.stream_id() {
-                return Err(Error::InvalidDependencyId);
-            }
-
             // Drop the next 5 bytes
             src.advance(5);
 
@@ -228,6 +227,11 @@ impl Headers {
             src.truncate(len);
         }
 
+        // Stream errors must not interrupt consumption of the connection's
+        // HPACK block, including any subsequent CONTINUATION frames.
+        let invalid_dependency = stream_dep
+            .as_ref()
+            .is_some_and(|dep| dep.dependency_id() == head.stream_id());
         let headers = Headers {
             stream_id: head.stream_id(),
             stream_dep,
@@ -236,7 +240,7 @@ impl Headers {
                 field_size: 0,
                 is_over_size: false,
                 regular_field_seen: false,
-                malformed: false,
+                malformed: invalid_dependency,
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -487,14 +491,15 @@ impl PushPromise {
                 return Err(Error::MalformedMessage);
             }
 
-            // TODO(hyper): Ensure payload is sized correctly
+            // The length byte exists; below, require the four-byte promised
+            // ID and ensure padding fits in the remaining payload.
             pad = src[0] as usize;
 
             // Drop the padding
             src.advance(1);
         }
 
-        if src.len() < 5 {
+        if src.len() < 4 {
             return Err(Error::MalformedMessage);
         }
 
@@ -656,6 +661,8 @@ impl Pseudo {
             path,
             protocol,
             status: None,
+            sensitivity: RequestSensitivity::default(),
+            status_sensitive: false,
         };
 
         // If the URI includes a scheme component, add it to the pseudo headers
@@ -679,6 +686,8 @@ impl Pseudo {
             path: None,
             protocol: None,
             status: Some(status),
+            sensitivity: RequestSensitivity::default(),
+            status_sensitive: false,
         }
     }
 
@@ -779,49 +788,309 @@ impl EncodingHeaderBlock {
 // ===== impl Iter =====
 
 impl Iterator for Iter {
-    type Item = hpack::Header<Option<BytesStr>>;
+    type Item = hpack::Header<Option<Bytes>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         use crate::hpack::Header::*;
 
         if let Some(ref mut pseudo) = self.pseudo {
             if let Some(method) = pseudo.method.take() {
-                return Some(Method(method));
+                return Some(
+                    Method(method).with_sensitive(
+                        pseudo
+                            .sensitivity
+                            .is_sensitive(RequestPseudoHeader::Method),
+                    ),
+                );
             }
 
             if let Some(scheme) = pseudo.scheme.take() {
-                return Some(Scheme(scheme));
+                return Some(
+                    Scheme(scheme).with_sensitive(
+                        pseudo
+                            .sensitivity
+                            .is_sensitive(RequestPseudoHeader::Scheme),
+                    ),
+                );
             }
 
             if let Some(authority) = pseudo.authority.take() {
-                return Some(Authority(authority));
+                return Some(
+                    Authority(authority).with_sensitive(
+                        pseudo
+                            .sensitivity
+                            .is_sensitive(RequestPseudoHeader::Authority),
+                    ),
+                );
             }
 
             if let Some(path) = pseudo.path.take() {
-                return Some(Path(path));
+                return Some(
+                    Path(path).with_sensitive(
+                        pseudo
+                            .sensitivity
+                            .is_sensitive(RequestPseudoHeader::Path),
+                    ),
+                );
             }
 
             if let Some(protocol) = pseudo.protocol.take() {
-                return Some(Protocol(protocol));
+                return Some(
+                    Protocol(protocol).with_sensitive(
+                        pseudo
+                            .sensitivity
+                            .is_sensitive(RequestPseudoHeader::Protocol),
+                    ),
+                );
             }
 
             if let Some(status) = pseudo.status.take() {
-                return Some(Status(status));
+                return Some(
+                    Status(status).with_sensitive(pseudo.status_sensitive),
+                );
             }
         }
 
         self.pseudo = None;
 
         self.fields.next().map(|h| {
-            let (name, value) = h.into_inner();
-            let name = Some(BytesStr::try_from(name).unwrap());
-            let value = BytesStr::try_from(value).unwrap();
+            let (name, value, sensitive) = h.into_parts();
+            let name = Some(name);
             Field {
                 name,
                 value,
             }
+            .with_sensitive(sensitive)
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn pseudo_sensitivity_message_forwarding() {
+    use crate::message::{IntoPseudo, frames_to_request, frames_to_response};
+    fn roundtrip(pseudo: Pseudo, response: bool) {
+        let mut fields = HeaderMap::new();
+        let mut regular = Header::new(
+            Bytes::from_static(b"x-secret"),
+            Bytes::from_static(b"opaque"),
+        );
+        regular.set_sensitive(true);
+        fields.extend([regular]);
+        let original_policy = pseudo.sensitivity;
+        let original_status = pseudo.status_sensitive;
+        let mut encoder = hpack::Encoder::default();
+        // Warm all static/dynamic matches before encoding the marked fields.
+        let mut warm = BytesMut::new();
+        let mut unmarked = Pseudo::default();
+        unmarked.method = pseudo.method.clone();
+        unmarked.scheme = pseudo.scheme.clone();
+        unmarked.authority = pseudo.authority.clone();
+        unmarked.path = pseudo.path.clone();
+        unmarked.protocol = pseudo.protocol.clone();
+        unmarked.status = pseudo.status;
+        encoder.encode(
+            Iter {
+                pseudo: Some(unmarked),
+                fields: HeaderMap::new().into_iter(),
+            },
+            &mut warm,
+        );
+        let mut decoder = hpack::Decoder::default();
+        decoder
+            .decode(&mut Cursor::new(&mut warm), |_| {})
+            .unwrap();
+        let mut wire = BytesMut::new();
+        encoder.encode(
+            Iter {
+                pseudo: Some(pseudo),
+                fields: fields.into_iter(),
+            },
+            &mut wire,
+        );
+        let mut frame = Headers::new(
+            StreamId::from(1),
+            Pseudo::default(),
+            HeaderMap::new(),
+        );
+        // Decode bytewise, exercising policy persistence across fragments.
+        let bytes = wire.freeze();
+        let mut fragment = BytesMut::new();
+        for byte in bytes {
+            fragment.extend_from_slice(&[byte]);
+            match frame.header_block.load(
+                &mut fragment,
+                usize::MAX,
+                &mut decoder,
+            ) {
+                Ok(())
+                | Err(Error::Hpack(hpack::DecoderError::NeedMore(_))) => {}
+                Err(error) => panic!("unexpected fragment error: {error:?}"),
+            }
+        }
+        let (pseudo, fields) = frame.into_parts();
+        assert_eq!(pseudo.sensitivity, original_policy);
+        assert_eq!(pseudo.status_sensitive, original_status);
+        let (forwarded, fields) = if response {
+            let (line, fields) =
+                frames_to_response(pseudo, fields, StreamId::from(1))
+                    .unwrap()
+                    .into_message_head();
+            assert_eq!(line.is_sensitive(), original_status);
+            (line.into_pseudo(), fields)
+        } else {
+            let scheme = pseudo.scheme.clone();
+            let authority = pseudo.authority.clone();
+            let path = pseudo.path.clone();
+            let protocol = pseudo.protocol.clone();
+            let (line, fields) =
+                frames_to_request(pseudo, fields, StreamId::from(1))
+                    .unwrap()
+                    .into_message_head();
+            assert_eq!(line.sensitivity(), original_policy);
+            let forwarded = line.into_pseudo();
+            assert_eq!(forwarded.scheme, scheme);
+            assert_eq!(forwarded.authority, authority);
+            assert_eq!(forwarded.path, path);
+            assert_eq!(forwarded.protocol, protocol);
+            (forwarded, fields)
+        };
+        assert!(
+            fields
+                .iter()
+                .next()
+                .unwrap()
+                .is_sensitive()
+        );
+        let expected: Vec<_> = Iter {
+            pseudo: Some(forwarded),
+            fields: fields.into_iter(),
+        }
+        .collect();
+        let mut wire = BytesMut::new();
+        encoder.encode(expected.clone(), &mut wire);
+        let mut index = 0;
+        decoder
+            .decode(&mut Cursor::new(&mut wire), |header| {
+                assert_eq!(
+                    header.is_sensitive(),
+                    expected[index].is_sensitive()
+                );
+                assert!(
+                    header.value_eq(&expected[index].clone().reify().unwrap())
+                );
+                index += 1;
+            })
+            .unwrap();
+        assert_eq!(index, expected.len());
+    }
+    for selector in [
+        RequestPseudoHeader::Method,
+        RequestPseudoHeader::Scheme,
+        RequestPseudoHeader::Authority,
+        RequestPseudoHeader::Path,
+        RequestPseudoHeader::Protocol,
+    ] {
+        let uri = Uri::builder()
+            .scheme(Scheme::HTTPS)
+            .authority("example.com")
+            .path("/socket?q=1")
+            .build()
+            .unwrap();
+        let mut pseudo = Pseudo::request(
+            Method::CONNECT,
+            uri,
+            Some(Protocol::from_static("websocket")),
+        );
+        pseudo
+            .sensitivity
+            .set_sensitive(selector, true);
+        roundtrip(pseudo, false);
+    }
+    let mut pseudo = Pseudo::request(
+        Method::GET,
+        Uri::builder()
+            .scheme(Scheme::HTTPS)
+            .path("/only?q=1")
+            .build()
+            .unwrap(),
+        None,
+    );
+    pseudo
+        .sensitivity
+        .set_sensitive(RequestPseudoHeader::Scheme, true);
+    roundtrip(pseudo, false);
+    let mut pseudo = Pseudo::request(
+        Method::CONNECT,
+        Uri::builder()
+            .authority("example.com:443")
+            .build()
+            .unwrap(),
+        None,
+    );
+    pseudo
+        .sensitivity
+        .set_sensitive(RequestPseudoHeader::Authority, true);
+    roundtrip(pseudo, false);
+    for status in [StatusCode::OK, StatusCode::CONTINUE] {
+        let mut pseudo = Pseudo::response(status);
+        pseudo.status_sensitive = true;
+        roundtrip(pseudo, true);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn sensitivity_duplicate_forwarding() {
+    let mut fields = HeaderMap::new();
+    for sensitive in [false, true, false, true] {
+        let mut field = Header::new(
+            Bytes::from_static(b"x-secret"),
+            Bytes::from_static(b"same"),
+        );
+        field.set_sensitive(sensitive);
+        fields.extend(std::iter::once(field));
+    }
+    let mut encoder = hpack::Encoder::default();
+    let block = HeaderBlock {
+        fields,
+        field_size: 0,
+        is_over_size: false,
+        regular_field_seen: false,
+        malformed: false,
+        pseudo: Pseudo::default(),
+    }
+    .into_encoding(&mut encoder);
+    let mut decoded =
+        Headers::new(StreamId::from(1), Pseudo::default(), HeaderMap::new());
+    let mut decoder = hpack::Decoder::default();
+    let mut wire = BytesMut::from(block.hpack.as_ref());
+    decoded
+        .header_block
+        .load(&mut wire, usize::MAX, &mut decoder)
+        .unwrap();
+    let flags: Vec<_> = decoded
+        .header_block
+        .fields
+        .iter()
+        .map(|h| h.is_sensitive())
+        .collect();
+    assert_eq!(flags, [false, true, false, true]);
+    let mut forwarded = BytesMut::new();
+    encoder.encode(
+        Iter {
+            pseudo: None,
+            fields: decoded.header_block.fields.into_iter(),
+        },
+        &mut forwarded,
+    );
+    let mut flags = Vec::new();
+    decoder
+        .decode(&mut std::io::Cursor::new(&mut forwarded), |h| {
+            flags.push(h.is_sensitive())
+        })
+        .unwrap();
+    assert_eq!(flags, [false, true, false, true]);
 }
 
 // ===== impl HeadersFlag =====
@@ -948,7 +1217,7 @@ impl HeaderBlock {
         let mut headers_size = self.calculate_header_list_size();
 
         macro_rules! set_pseudo {
-            ($field:ident, $val:expr) => {{
+            ($field:ident, $val:expr, $policy:expr) => {{
                 if reg {
                     tracing::trace!("load_hpack; header malformed -- pseudo not at head of block");
                     malformed = true;
@@ -961,6 +1230,7 @@ impl HeaderBlock {
                         decoded_header_size(stringify!($field).len() + 1, __val.as_str().len());
                     if headers_size < max_header_list_size {
                         self.pseudo.$field = Some(__val);
+                        $policy;
                     } else if !self.is_over_size {
                         tracing::trace!("load_hpack; header list size over max");
                         self.is_over_size = true;
@@ -975,16 +1245,24 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header| {
+        let res = decoder.decode_fragment(&mut cursor, |header| {
             use crate::hpack::Header::*;
 
             if !header.is_valid_field() {
                 malformed = true;
                 reg = true;
+                let size = header.len();
+                headers_size = headers_size.saturating_add(size);
+                self.field_size = self.field_size.saturating_add(size);
+                if headers_size >= max_header_list_size {
+                    self.is_over_size = true;
+                }
                 return;
             }
 
-            match header {
+            let sensitive = header.is_sensitive();
+            match header.into_unmarked() {
+                Sensitive(_) => unreachable!("sensitivity wrapper removed"),
                 Field { name, value } => {
                     // Every regular field ends the pseudoheader section, even
                     // when the field itself makes the message malformed.
@@ -1000,7 +1278,7 @@ impl HeaderBlock {
                     {
                         tracing::trace!("load_hpack; connection level header");
                         malformed = true;
-                    } else if name.as_ref() == TE && value != "trailers" {
+                    } else if name.as_ref() == TE && !value.eq_ignore_ascii_case(b"trailers") {
                         tracing::trace!(
                             "load_hpack; TE header not set to trailers; val={:?}",
                             value
@@ -1009,23 +1287,25 @@ impl HeaderBlock {
                     } else {
                         reg = true;
 
-                        headers_size += decoded_header_size(name.as_str().len(), value.len());
+                        headers_size += decoded_header_size(name.len(), value.len());
                         if headers_size < max_header_list_size {
                             self.field_size +=
-                                decoded_header_size(name.as_str().len(), value.len());
-                            self.fields.insert(name.into_inner(), value.into_inner());
+                                decoded_header_size(name.len(), value.len());
+                            let mut field = Header::new(name, value);
+                            field.set_sensitive(sensitive);
+                            self.fields.extend(std::iter::once(field));
                         } else if !self.is_over_size {
                             tracing::trace!("load_hpack; header list size over max");
                             self.is_over_size = true;
                         }
                     }
                 }
-                Authority(v) => set_pseudo!(authority, v),
-                Method(v) => set_pseudo!(method, v),
-                Scheme(v) => set_pseudo!(scheme, v),
-                Path(v) => set_pseudo!(path, v),
-                Protocol(v) => set_pseudo!(protocol, v),
-                Status(v) => set_pseudo!(status, v),
+                Authority(v) => set_pseudo!(authority, v, self.pseudo.sensitivity.set_sensitive(RequestPseudoHeader::Authority, sensitive)),
+                Method(v) => set_pseudo!(method, v, self.pseudo.sensitivity.set_sensitive(RequestPseudoHeader::Method, sensitive)),
+                Scheme(v) => set_pseudo!(scheme, v, self.pseudo.sensitivity.set_sensitive(RequestPseudoHeader::Scheme, sensitive)),
+                Path(v) => set_pseudo!(path, v, self.pseudo.sensitivity.set_sensitive(RequestPseudoHeader::Path, sensitive)),
+                Protocol(v) => set_pseudo!(protocol, v, self.pseudo.sensitivity.set_sensitive(RequestPseudoHeader::Protocol, sensitive)),
+                Status(v) => set_pseudo!(status, v, self.pseudo.status_sensitive = sensitive),
             }
         });
 
@@ -1119,52 +1399,156 @@ mod test {
         huffman::decode(src, &mut buf).unwrap()
     }
 
-    // TODO: support
     #[test]
-    #[ignore]
-    fn test_nameless_header_at_resume() {
-        let mut encoder = Encoder::default();
-        let mut dst = BytesMut::new();
+    fn push_promise_empty_fragment_and_padding_boundaries() {
+        for (flags, payload) in [
+            (0, b"\0\0\0\x02".as_slice()),
+            (8, b"\0\0\0\0\x02".as_slice()),
+            (8, b"\x01\0\0\0\x02\0".as_slice()),
+        ] {
+            let head = Head::new(Kind::PushPromise, flags, StreamId::from(1));
+            let (promise, fragment) =
+                PushPromise::load(head, BytesMut::from(payload)).unwrap();
+            assert_eq!(promise.promised_id(), StreamId::from(2));
+            assert!(fragment.is_empty());
+        }
+        for payload in [b"".as_slice(), b"\0", b"\0\0\0"] {
+            let head = Head::new(Kind::PushPromise, 0, StreamId::from(1));
+            assert!(matches!(
+                PushPromise::load(head, BytesMut::from(payload)),
+                Err(Error::MalformedMessage)
+            ));
+        }
+        let head = Head::new(Kind::PushPromise, 8, StreamId::from(1));
+        assert!(matches!(
+            PushPromise::load(head, BytesMut::from(&b"\x01\0\0\0\x02"[..])),
+            Err(Error::TooMuchPadding)
+        ));
+    }
 
-        let mut headers = HeaderMap::new();
-        headers.insert("hello", "world");
-        headers.insert("hello", "zomg");
-        headers.insert("hello", "sup");
-
+    #[test]
+    fn outbound_opaque_value_round_trip() {
+        let mut fields = HeaderMap::new();
+        fields.insert(
+            Bytes::from_static(b"x-opaque"),
+            Bytes::from_static(b"\x80\xff"),
+        );
         let headers =
-            Headers::new(StreamId::ZERO, Default::default(), headers);
-
-        let continuation = headers
-            .encode(&mut encoder, &mut (&mut dst).limit(frame::HEADER_LEN + 8))
-            .unwrap();
-
-        assert_eq!(17, dst.len());
-        assert_eq!([0, 0, 8, 1, 0, 0, 0, 0, 0], &dst[0..9]);
-        assert_eq!(&[0x40, 0x80 | 4], &dst[9..11]);
-        assert_eq!("hello", huff_decode(&dst[11..15]));
-        assert_eq!(0x80 | 4, dst[15]);
-
-        let mut world = dst[16..17].to_owned();
-
-        dst.clear();
-
+            Headers::new(StreamId::from(1), Pseudo::default(), fields);
+        let mut encoded = BytesMut::new();
         assert!(
-            continuation
-                .encode(&mut (&mut dst).limit(frame::HEADER_LEN + 16))
+            headers
+                .encode(
+                    &mut Encoder::default(),
+                    &mut (&mut encoded).limit(4096)
+                )
                 .is_none()
         );
+        let mut decoded = Vec::new();
+        let mut payload = encoded.split_off(frame::HEADER_LEN);
+        hpack::Decoder::default()
+            .decode(&mut Cursor::new(&mut payload), |h| decoded.push(h))
+            .unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].value_slice(), b"\x80\xff");
+    }
 
-        world.extend_from_slice(&dst[9..12]);
-        assert_eq!("world", huff_decode(&world));
+    #[test]
+    fn malformed_fields_preserve_dynamic_table() {
+        for name in [b"".as_slice(), b"X-bad", b"x bad"] {
+            let mut decoder = hpack::Decoder::default();
+            let mut encoder = Encoder::default();
+            let bad = hpack::Header::new(
+                Bytes::copy_from_slice(name),
+                Bytes::from_static(b"value"),
+            )
+            .unwrap();
+            let good = hpack::Header::new(
+                Bytes::from_static(b"x-good"),
+                Bytes::from_static(b"valid"),
+            )
+            .unwrap();
+            let mut wire = BytesMut::new();
+            encoder.encode(vec![bad.into(), good.clone().into()], &mut wire);
+            let mut block = Headers::new(
+                StreamId::from(1),
+                Pseudo::default(),
+                HeaderMap::new(),
+            );
+            assert!(
+                block
+                    .load_hpack(&mut wire, 4096, &mut decoder)
+                    .is_err()
+            );
+            // The last incrementally indexed field is dynamic entry 62.
+            let mut wire = BytesMut::from(&b"\xbe"[..]);
+            let mut next = Headers::new(
+                StreamId::from(3),
+                Pseudo::default(),
+                HeaderMap::new(),
+            );
+            next.load_hpack(&mut wire, 4096, &mut decoder)
+                .unwrap();
+            let mut fields = next.fields().iter();
+            let field = fields
+                .next()
+                .expect("dynamic field must survive malformed block");
+            let (name, value) = field.clone().into_inner();
+            assert_eq!(name.as_ref(), b"x-good");
+            assert_eq!(value.as_ref(), b"valid");
+            assert!(fields.next().is_none());
+        }
+    }
 
-        assert_eq!(24, dst.len());
-        assert_eq!([0, 0, 15, 9, 4, 0, 0, 0, 0], &dst[0..9]);
-
-        // // Next is not indexed
-        assert_eq!(&[15, 47, 0x80 | 3], &dst[12..15]);
-        assert_eq!("zomg", huff_decode(&dst[15..18]));
-        assert_eq!(&[15, 47, 0x80 | 3], &dst[18..21]);
-        assert_eq!("sup", huff_decode(&dst[21..]));
+    #[test]
+    fn test_nameless_header_at_resume() {
+        let mut encoder = Encoder::default();
+        let mut first = BytesMut::new();
+        let mut headers = HeaderMap::new();
+        for (value, sensitive) in
+            [("world", false), ("zomg", true), ("sup", false)]
+        {
+            let mut header = Header::new(
+                Bytes::from_static(b"hello"),
+                Bytes::copy_from_slice(value.as_bytes()),
+            );
+            header.set_sensitive(sensitive);
+            headers.extend([header]);
+        }
+        let continuation =
+            Headers::new(StreamId::from(1), Pseudo::default(), headers)
+                .encode(
+                    &mut encoder,
+                    &mut (&mut first).limit(frame::HEADER_LEN + 8),
+                )
+                .unwrap();
+        assert_eq!(first[3], 1);
+        assert_eq!(first[4] & 4, 0);
+        let mut second = BytesMut::new();
+        assert!(
+            continuation
+                .encode(&mut (&mut second).limit(1024))
+                .is_none()
+        );
+        assert_eq!(second[3], 9);
+        assert_eq!(second[4] & 4, 4);
+        let mut wire = BytesMut::from(&first[frame::HEADER_LEN..]);
+        wire.extend_from_slice(&second[frame::HEADER_LEN..]);
+        let mut decoded = Vec::new();
+        hpack::Decoder::default()
+            .decode(&mut Cursor::new(&mut wire), |h| {
+                assert_eq!(h.name().as_slice(), b"hello");
+                decoded.push((h.value_slice().to_vec(), h.is_sensitive()));
+            })
+            .unwrap();
+        assert_eq!(
+            decoded,
+            vec![
+                (b"world".to_vec(), false),
+                (b"zomg".to_vec(), true),
+                (b"sup".to_vec(), false)
+            ]
+        );
     }
 
     #[test]

@@ -4,6 +4,9 @@ use crate::{frame::Settings, spa::SpaTracker};
 
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
+    #[cfg(feature = "test-util")]
+    pub initial_stream_id: crate::frame::StreamId,
+
     /// Initial target window size for new connections.
     pub initial_connection_window_size: Option<u32>,
 

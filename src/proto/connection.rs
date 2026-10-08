@@ -113,11 +113,9 @@ where
     }
 
     // ===== CLIENT =====
-    /// Closes the connection by transitioning to a GOAWAY state
-    /// if there are no streams or references
+    /// Closes the connection with GOAWAY when no streams or other references remain.
     pub fn maybe_close_connection_if_no_streams(&mut self) {
-        // If we poll() and realize that there are no streams or references
-        // then we can close the connection by transitioning to GOAWAY
+        // The stream state tracks active streams and outstanding references.
         if !self
             .streams
             .has_streams_or_other_references()
@@ -128,8 +126,6 @@ where
 
     /// Checks if there are any streams or references left
     pub fn has_streams_or_other_references(&self) -> bool {
-        // If we poll() and realize that there are no streams or references
-        // then we can close the connection by transitioning to GOAWAY
         self.streams
             .has_streams_or_other_references()
     }
@@ -457,10 +453,9 @@ where
                 }
                 Ok(())
             }
-            // Attempting to read a frame resulted in an I/O error. All
-            // active streams must be reset.
-            //
-            // TODO(hyper): Are I/O errors recoverable?
+            // Transport errors are terminal: notify all active streams and
+            // do not retry the connection. The clean UnexpectedEof exception
+            // below applies only when no outbound stream data remains.
             Err(ProtoError::Io(kind, inner)) => {
                 let e = ProtoError::Io(kind, inner);
                 // Reset and Notify all active streams

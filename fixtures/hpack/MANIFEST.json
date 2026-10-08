@@ -1,0 +1,13 @@
+{
+  "source": "RFC 7541 (May 2015), Roberto Peon and Herve Ruellan",
+  "source_url": "https://www.rfc-editor.org/rfc/rfc7541.txt",
+  "license": "Simplified BSD; see LICENSE.txt and ATTRIBUTION.md",
+  "story_count": 4,
+  "case_count": 12,
+  "files": [
+    {"path":"rfc7541/requests-plain.json","sections":"C.3.1-C.3.3","cases":3,"sha256":"fde9d1b3d01c5fa5a9bd50e200b9ea50fb369b92b8ce9cc9397e684aff21e19b"},
+    {"path":"rfc7541/requests-huffman.json","sections":"C.4.1-C.4.3","cases":3,"sha256":"0dc9f0f2e15065d3541aab52503f017a230e5687d77a66c8a4ed85e47ccf6518"},
+    {"path":"rfc7541/responses-plain.json","sections":"C.5.1-C.5.3","cases":3,"sha256":"2aafa1450f5f417e8f68e379fcff289e448fb4dd4a365a7b01ab9b7233697821"},
+    {"path":"rfc7541/responses-huffman.json","sections":"C.6.1-C.6.3","cases":3,"sha256":"401eb68ad5f7d8e46dbd7e393a39ebdaa5491bf8d6b0527f6988e5ff7098f746"}
+  ]
+}

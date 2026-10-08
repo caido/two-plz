@@ -496,8 +496,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 [[package]]
 name = "header-plz"
 version = "0.0.50"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2dbfb70309a4acbb4390ed60986fc59777045cdfae811a78c19f1c043130a0b0"
+source = "git+ssh://git@github.com/caido/primitives.git?rev=67d43e6e912272e12561db5bfa40f6067bb9bd78#67d43e6e912272e12561db5bfa40f6067bb9bd78"
 dependencies = [
  "buffer-plz",
  "bytes",
@@ -1451,6 +1450,7 @@ dependencies = [
  "support",
  "tokio",
  "tracing",
+ "two-plz",
 ]
 
 [[package]]

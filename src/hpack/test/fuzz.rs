@@ -1,6 +1,6 @@
 use crate::hpack::{BytesStr, Decoder, Encoder, Header};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 use rand::distr::slice::Choose;
 use rand::rngs::StdRng;
@@ -42,7 +42,7 @@ struct FuzzHpack {
 #[derive(Debug, Clone)]
 struct HeaderFrame {
     resizes: Vec<usize>,
-    headers: Vec<Header<Option<BytesStr>>>,
+    headers: Vec<Header<Option<Bytes>>>,
 }
 
 impl FuzzHpack {
@@ -51,7 +51,7 @@ impl FuzzHpack {
         let mut rng = StdRng::from_seed(seed);
 
         // Generates a bunch of source headers
-        let mut source: Vec<Header<Option<BytesStr>>> = vec![];
+        let mut source: Vec<Header<Option<Bytes>>> = vec![];
 
         for _ in 0..2000 {
             source.push(gen_header(&mut rng));
@@ -97,7 +97,7 @@ impl FuzzHpack {
                 let i = (x * source.len() as f64) as usize;
 
                 let header = &source[i];
-                match header {
+                match header.clone().into_unmarked() {
                     Header::Field {
                         name: None,
                         ..
@@ -144,7 +144,7 @@ impl FuzzHpack {
             for header in &frame.headers {
                 match header.clone().reify() {
                     Ok(h) => {
-                        prev_name = match h {
+                        prev_name = match h.clone().into_unmarked() {
                             Header::Field {
                                 ref name,
                                 ..
@@ -153,22 +153,25 @@ impl FuzzHpack {
                         };
                         expect.push(h);
                     }
-                    Err(value) => {
-                        expect.push(Header::Field {
-                            name: prev_name
-                                .as_ref()
-                                .cloned()
-                                .expect("previous header name"),
-                            value,
-                        });
+                    Err((value, sensitive)) => {
+                        expect.push(
+                            Header::Field {
+                                name: prev_name
+                                    .as_ref()
+                                    .cloned()
+                                    .expect("previous header name"),
+                                value,
+                            }
+                            .with_sensitive(sensitive),
+                        );
                     }
                 }
             }
 
             let mut buf = BytesMut::new();
 
-            if let Some(max) = frame.resizes.iter().max() {
-                decoder.queue_size_update(*max);
+            for resize in &frame.resizes {
+                decoder.queue_size_update(*resize);
             }
 
             // Apply resizes
@@ -197,7 +200,7 @@ impl Arbitrary for FuzzHpack {
     }
 }
 
-fn gen_header(g: &mut StdRng) -> Header<Option<BytesStr>> {
+fn gen_header(g: &mut StdRng) -> Header<Option<Bytes>> {
     use header_plz::{Method, status::StatusCode};
 
     if g.random_ratio(1, 10) {
@@ -264,14 +267,12 @@ fn gen_header(g: &mut StdRng) -> Header<Option<BytesStr>> {
         };
         let value = gen_header_value(g);
 
-        //if g.random_ratio(1, 30) {
-        //    value.set_sensitive(true);
-        //}
-
+        let sensitive = g.random_ratio(1, 30);
         Header::Field {
-            name,
-            value,
+            name: name.map(BytesStr::into_inner),
+            value: value.into_inner(),
         }
+        .with_sensitive(sensitive)
     }
 }
 

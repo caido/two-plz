@@ -43,7 +43,6 @@ const CHAIN_THRESHOLD: usize = 256;
 /// fragmented data being sent, and hereby improve the throughput.
 const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
 
-// TODO(hyper): Make generic
 impl<T, B> FramedWrite<T, B>
 where
     T: AsyncWrite + Unpin,
@@ -208,7 +207,7 @@ impl<T: Unpin, B> Unpin for FramedWrite<T, B> {}
 struct Encoder<B> {
     hpack: hpack::Encoder,
     /// Write buffer
-    /// TODO(hyper): Should this be a ring buffer?
+    /// TODO(hyper): Consider a ring buffer only if benchmarks justify the added complexity.
     buf: Cursor<BytesMut>,
 
     /// Next frame to encode

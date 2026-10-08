@@ -99,8 +99,13 @@ where
         self.connection
             .streams
             .set_streaming_accept();
-        if self.connection.poll(cx)?.is_ready() {
-            return Poll::Ready(None);
+        match self.connection.poll(cx) {
+            Poll::Ready(result) => {
+                let _ = self.connection.streams.recv_eof(true);
+                result?;
+                return Poll::Ready(None);
+            }
+            Poll::Pending => {}
         }
         if let Some(inner) = self.connection.next_accept() {
             let request = inner.take_request();
@@ -133,10 +138,14 @@ where
             return Poll::Ready(Some(Err(UserError::Rejected.into())));
         }
         self.streaming_accept = Some(false);
-        if self.connection.poll(cx)?.is_ready() {
-            // If the socket is closed, don't return anything
-            // TODO: drop any pending streams
-            return Poll::Ready(None);
+        match self.connection.poll(cx) {
+            Poll::Ready(result) => {
+                // Terminal connections discard requests that were never accepted.
+                let _ = self.connection.streams.recv_eof(true);
+                result?;
+                return Poll::Ready(None);
+            }
+            Poll::Pending => {}
         }
 
         if let Some(inner) = self.connection.next_accept() {
@@ -153,7 +162,9 @@ where
     /// Returns `Ready` when the underlying connection has closed.
     ///
     /// If any new inbound streams are received during a call to `poll_closed`,
-    /// they will be queued and returned on the next call to [`poll_accept`].
+    /// they will be queued and returned on the next call to [`poll_accept`]
+    /// while the connection remains active. Terminal closure discards requests
+    /// that have not been accepted.
     ///
     /// This function will advance the internal connection state, driving
     /// progress on all the other handles (e.g. [`RecvStream`] and [`SendStream`]).
@@ -170,9 +181,11 @@ where
         if self.streaming_accept.is_none() {
             self.streaming_accept = Some(false);
         }
-        self.connection
-            .poll(cx)
-            .map_err(Into::into)
+        let result = self.connection.poll(cx);
+        if result.is_ready() {
+            let _ = self.connection.streams.recv_eof(true);
+        }
+        result.map_err(Into::into)
     }
 
     pub fn num_wired_streams(&self) -> usize {

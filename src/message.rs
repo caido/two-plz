@@ -11,6 +11,10 @@ use header_plz::{
 };
 use http_plz::{Message, Request, Response};
 
+#[cfg(test)]
+#[path = "message/sensitivity_tests.rs"]
+mod sensitivity_tests;
+
 /// Validate an outbound extended CONNECT before allocating a stream ID.
 /// Every request extension is a :protocol value in this API.
 pub(crate) fn validate_extended_connect_request(
@@ -169,10 +173,12 @@ impl From<header::BytesStr> for header_plz::bytes_str::BytesStr {
 
 impl IntoPseudo for RequestLine {
     fn into_pseudo(self) -> Pseudo {
-        let (method, uri, ext) = self.into_parts();
+        let (method, uri, ext, sensitivity) =
+            self.into_parts_with_sensitivity();
         let is_connect = method == Method::CONNECT;
         let protocol = ext.and_then(|e| Protocol::try_from(*e).ok());
         let mut pseudo = Pseudo::request(method, uri, protocol);
+        pseudo.sensitivity = sensitivity;
 
         if pseudo.scheme.is_none() && !is_connect {
             pseudo.set_scheme(Scheme::HTTP)
@@ -184,7 +190,10 @@ impl IntoPseudo for RequestLine {
 
 impl IntoPseudo for ResponseLine {
     fn into_pseudo(self) -> Pseudo {
-        Pseudo::response(self.into_parts())
+        let (status, sensitive) = self.into_parts_with_sensitivity();
+        let mut pseudo = Pseudo::response(status);
+        pseudo.status_sensitive = sensitive;
+        pseudo
     }
 }
 
@@ -291,7 +300,6 @@ pub(crate) fn frames_to_request(
     let mut uri_b = Uri::builder();
 
     // authority
-    let mut has_authority = false;
     if has_protocol
         && pseudo
             .authority
@@ -301,7 +309,6 @@ pub(crate) fn frames_to_request(
         malformed!("malformed headers| missing authority in extended CONNECT");
     }
     if let Some(authority) = pseudo.authority {
-        has_authority = true;
         uri_b = uri_b.authority(authority);
     }
 
@@ -318,12 +325,7 @@ pub(crate) fn frames_to_request(
             Err(_) => malformed!("malformed headers| invalid scheme"),
         };
 
-        // It's not possible to build an `Uri` from a scheme and path. So,
-        // after validating is was a valid scheme, we just have to drop it
-        // if there isn't an :authority.
-        if has_authority {
-            uri_b = uri_b.scheme(scheme);
-        }
+        uri_b = uri_b.scheme(scheme);
     } else if !is_connect || has_protocol {
         malformed!("malformed headers| missing scheme");
     }
@@ -350,7 +352,9 @@ pub(crate) fn frames_to_request(
     b = b.uri(uri);
     b = b.headers(headers);
 
-    Ok(b.build())
+    let (mut line, headers) = b.build().into_message_head();
+    line.set_sensitivity(pseudo.sensitivity);
+    Ok(Message::new(line, headers, None, None))
 }
 
 pub(crate) fn frames_to_response(
@@ -364,5 +368,10 @@ pub(crate) fn frames_to_response(
     }
     b = b.headers(headers);
     // safe to unwrap, status code error already checked in previous step
-    Ok(b.build().expect("invalid scode"))
+    let (mut line, headers) = b
+        .build()
+        .expect("invalid scode")
+        .into_message_head();
+    line.set_sensitive(pseudo.status_sensitive);
+    Ok(Message::new(line, headers, None, None))
 }

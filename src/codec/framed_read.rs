@@ -169,13 +169,6 @@ fn decode_frame(
             // Parse the header frame w/o parsing the payload
             let (mut frame, mut payload) = match frame::$frame::load($head, $bytes) {
                 Ok(res) => res,
-                Err(frame::Error::InvalidDependencyId) => {
-                    proto_err!(stream: "invalid HEADERS dependency ID");
-                    // A stream cannot depend on itself. An endpoint MUST
-                    // treat this as a stream error (Section 5.4.2) of type
-                    // `PROTOCOL_ERROR`.
-                    return Err(ProtoError::library_reset($head.stream_id(), Reason::PROTOCOL_ERROR));
-                },
                 Err(e) => {
                     proto_err!(conn: "failed to load frame; err={:?}", e);
                     return Err(ProtoError::library_go_away(Reason::PROTOCOL_ERROR));
@@ -184,6 +177,8 @@ fn decode_frame(
 
             let is_end_headers = frame.is_end_headers();
 
+            // Only an initial HEADERS or PUSH_PROMISE starts a new HPACK block.
+            hpack.begin_block();
             // Load the HPACK encoded headers
             match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
                 Ok(_) => {},
@@ -193,17 +188,23 @@ fn decode_frame(
                 Err(frame::Error::MalformedMessage) if !is_end_headers => {},
                 Err(frame::Error::MalformedMessage) if matches!(kind, Kind::PushPromise) => {},
                 Err(frame::Error::MalformedMessage) => {
+                    hpack.end_block().map_err(|_| {
+                        ProtoError::library_go_away(Reason::COMPRESSION_ERROR)
+                    })?;
                     let id = $head.stream_id();
                     proto_err!(stream: "malformed header block; stream={:?}", id);
                     return Err(ProtoError::library_reset(id, Reason::PROTOCOL_ERROR));
                 },
                 Err(e) => {
                     proto_err!(conn: "failed HPACK decoding; err={:?}", e);
-                    return Err(ProtoError::library_go_away(Reason::PROTOCOL_ERROR));
+                    return Err(ProtoError::library_go_away(Reason::COMPRESSION_ERROR));
                 }
             }
 
             if is_end_headers {
+                hpack.end_block().map_err(|_| {
+                    ProtoError::library_go_away(Reason::COMPRESSION_ERROR)
+                })?;
                 frame.into()
             } else {
                 //tracing::trace!("loaded partial header block");
@@ -252,7 +253,9 @@ fn decode_frame(
             bytes.advance(frame::HEADER_LEN);
             let res = frame::Data::load(head, bytes.freeze());
 
-            // TODO(hyper): Should this always be connection level? Probably not...
+            // Loading rejects structural faults (stream ID zero or invalid
+            // padding), which are connection-level PROTOCOL_ERRORs. Stream
+            // state and flow-control checks happen after successful loading.
             res.map_err(|e| {
                 proto_err!(conn: "failed to load DATA frame; err={:?}", e);
                 ProtoError::library_go_away(Reason::PROTOCOL_ERROR)
@@ -399,6 +402,9 @@ fn decode_frame(
                         Continuable::PushPromise(_)
                     ) => {}
                 Err(frame::Error::MalformedMessage) => {
+                    hpack.end_block().map_err(|_| {
+                        ProtoError::library_go_away(Reason::COMPRESSION_ERROR)
+                    })?;
                     let id = head.stream_id();
                     proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);
                     return Err(ProtoError::library_reset(
@@ -409,12 +415,15 @@ fn decode_frame(
                 Err(e) => {
                     proto_err!(conn: "failed HPACK decoding; err={:?}", e);
                     return Err(ProtoError::library_go_away(
-                        Reason::PROTOCOL_ERROR,
+                        Reason::COMPRESSION_ERROR,
                     ));
                 }
             }
 
             if is_end_headers {
+                hpack.end_block().map_err(|_| {
+                    ProtoError::library_go_away(Reason::COMPRESSION_ERROR)
+                })?;
                 partial.frame.into()
             } else {
                 *partial_inout = Some(partial);

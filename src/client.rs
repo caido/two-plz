@@ -29,6 +29,21 @@ pub struct Client {
 pub type ClientBuilder = Builder<Client>;
 
 impl ClientBuilder {
+    /// Sets the first client stream ID for testing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ID is zero, even, or greater than `0x7fff_ffff`.
+    #[cfg(feature = "test-util")]
+    pub fn initial_stream_id(mut self, stream_id: u32) -> Self {
+        assert!(
+            stream_id != 0 && stream_id <= 0x7fff_ffff && stream_id % 2 == 1,
+            "initial client stream ID must be nonzero, odd, and at most 0x7fffffff"
+        );
+        self.initial_stream_id = stream_id.into();
+        self
+    }
+
     /// Opt in to receiving server push. Disabled by default.
     pub fn enable_push(mut self, enabled: bool) -> Self {
         self.settings.set_enable_push(enabled);

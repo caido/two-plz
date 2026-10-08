@@ -1,0 +1,9 @@
+{
+  "source": "RFC 7541, May 2015, C.5.1-C.5.3",
+  "header_table_size": 256,
+  "cases": [
+    {"seqno":0,"wire":"4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d","headers":[{":status":"302"},{"cache-control":"private"},{"date":"Mon, 21 Oct 2013 20:13:21 GMT"},{"location":"https://www.example.com"}]},
+    {"seqno":1,"wire":"4803333037c1c0bf","headers":[{":status":"307"},{"cache-control":"private"},{"date":"Mon, 21 Oct 2013 20:13:21 GMT"},{"location":"https://www.example.com"}]},
+    {"seqno":2,"wire":"88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31","headers":[{":status":"200"},{"cache-control":"private"},{"date":"Mon, 21 Oct 2013 20:13:22 GMT"},{"location":"https://www.example.com"},{"content-encoding":"gzip"},{"set-cookie":"foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"}]}
+  ]
+}

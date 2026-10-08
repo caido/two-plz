@@ -3,17 +3,12 @@ use tokio::io::AsyncWriteExt;
 
 const SETTINGS_ACK: &[u8] = &[0, 0, 0, 4, 1, 0, 0, 0, 0];
 
-// skipped
-// push_request
-// push_request_disabled
-// push_request_against_concurrency
-// push_request_with_data
-// push_request_between_data
-// sends_reset_no_error_when_req_body_is_dropped
-// poll_reset
-// poll_reset_io_error
-// poll_reset_after_send_response_is_user_error
-// serve_when_request_in_response_extensions : TODO
+// Push coverage lives in push.rs. Request bodies here are buffered rather than
+// independently dropped receive streams; the historical receive-body/poll-reset
+// inventory described a different API.
+// Request-in-response-extension ownership coverage requires an extension API:
+// http-plz 0.0.12 Response (Message<ResponseLine>) currently has none. See
+// TEST_SUPPORT_IMPLEMENTATION.md for the blocked requirement.
 
 #[tokio::test]
 async fn read_preface_in_multiple_frames() {

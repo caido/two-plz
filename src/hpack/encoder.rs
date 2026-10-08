@@ -1,9 +1,9 @@
-use crate::hpack::{BytesStr, Header};
+use crate::hpack::Header;
 
 use super::huffman;
 use super::table::{Index, Table};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 #[derive(Debug)]
 pub struct Encoder {
@@ -61,7 +61,7 @@ impl Encoder {
     /// Encode a set of headers into the provide buffer
     pub fn encode<I>(&mut self, headers: I, dst: &mut BytesMut)
     where
-        I: IntoIterator<Item = Header<Option<BytesStr>>>,
+        I: IntoIterator<Item = Header<Option<Bytes>>>,
     {
         let span = tracing::trace_span!("hpack::encode");
         let _e = span.enter();
@@ -84,12 +84,13 @@ impl Encoder {
                 // the name is the same as the previously yielded header. In
                 // which case, we skip table lookup and just use the same index
                 // as the previous entry.
-                Err(value) => {
+                Err((value, sensitive)) => {
                     self.encode_header_without_name(
                         last_index.as_ref().unwrap_or_else(|| {
                             panic!("encoding header without name, but no previous index to use for name");
                         }),
                         &value,
+                        sensitive,
                         dst,
                     );
                 }
@@ -162,7 +163,8 @@ impl Encoder {
     fn encode_header_without_name(
         &mut self,
         last: &Index,
-        value: &BytesStr,
+        value: &Bytes,
+        sensitive: bool,
         dst: &mut BytesMut,
     ) {
         match *last {
@@ -172,13 +174,7 @@ impl Encoder {
             | Index::InsertedValue(..) => {
                 let idx = self.table.resolve_idx(last);
 
-                encode_not_indexed(
-                    idx,
-                    value.as_ref(),
-                    false,
-                    // TODO: value.is_sensitive(),
-                    dst,
-                );
+                encode_not_indexed(idx, value.as_ref(), sensitive, dst);
             }
             Index::NotIndexed(_) => {
                 let last = self.table.resolve(last);
@@ -186,8 +182,7 @@ impl Encoder {
                 encode_not_indexed2(
                     last.name().as_slice(),
                     value.as_ref(),
-                    false,
-                    // TODO: value.is_sensitive(),
+                    sensitive,
                     dst,
                 );
             }
@@ -333,6 +328,111 @@ mod test {
     }
 
     #[test]
+    fn sensitive_new_names_and_nameless_duplicates_do_not_enter_table() {
+        for size in [0, 4096] {
+            let mut encoder = Encoder::new(size, 0);
+            let mut wire = BytesMut::new();
+            let first = crate::hpack::Header::new(
+                Bytes::from_static(b"x-secret"),
+                Bytes::from_static(b"first"),
+            )
+            .unwrap()
+            .with_sensitive(true);
+            let second = crate::hpack::Header::Field {
+                name: None,
+                value: Bytes::from_static(b"second"),
+            }
+            .with_sensitive(true);
+            encoder.encode([first.into(), second], &mut wire);
+            assert_eq!(encoder.table.len(), 0);
+            assert_eq!(encoder.table.size(), 0);
+            let mut decoder = crate::hpack::Decoder::default();
+            let mut count = 0;
+            decoder
+                .decode(&mut std::io::Cursor::new(&mut wire), |h| {
+                    assert!(h.is_sensitive());
+                    assert_eq!(h.name().as_slice(), b"x-secret");
+                    count += 1;
+                })
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+    }
+
+    #[test]
+    fn sensitive_fields_never_use_full_indexes() {
+        let mut encoder = Encoder::default();
+        let mut decoder = crate::hpack::Decoder::default();
+        for (name, value) in [
+            (b":path".as_slice(), b"/".as_slice()),
+            (b"x-secret".as_slice(), b"opaque".as_slice()),
+        ] {
+            let header = crate::hpack::Header::new(
+                Bytes::copy_from_slice(name),
+                Bytes::copy_from_slice(value),
+            )
+            .unwrap();
+            let mut warm = BytesMut::new();
+            encoder.encode(std::iter::once(header.clone().into()), &mut warm);
+            decoder
+                .decode(&mut std::io::Cursor::new(&mut warm), |_| {})
+                .unwrap();
+            for _ in 0..2 {
+                let mut wire = BytesMut::new();
+                encoder.encode(
+                    std::iter::once(
+                        header
+                            .clone()
+                            .with_sensitive(true)
+                            .into(),
+                    ),
+                    &mut wire,
+                );
+                assert_eq!(wire[0] & 0xf0, 0x10);
+                decoder
+                    .decode(&mut std::io::Cursor::new(&mut wire), |decoded| {
+                        assert!(decoded.is_sensitive());
+                        assert!(decoded.value_eq(&header));
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_and_case_sensitive_round_trips() {
+        let mut encoder = Encoder::default();
+        let mut decoder = crate::hpack::Decoder::default();
+        for (name, value) in [
+            (b"x-opaque".as_slice(), b"\x80\xff".as_slice()),
+            (b"content-language".as_slice(), b"\xfe".as_slice()),
+            (b"accept-encoding".as_slice(), b"GZIP, DEFLATE".as_slice()),
+        ] {
+            let field = Header::new(
+                Bytes::copy_from_slice(name),
+                Bytes::copy_from_slice(value),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let mut encoded =
+                    encode(&mut encoder, vec![field.clone().into()]);
+                let mut decoded = Vec::new();
+                decoder
+                    .decode(&mut std::io::Cursor::new(&mut encoded), |h| {
+                        decoded.push(h)
+                    })
+                    .unwrap();
+                assert_eq!(decoded, vec![field.clone()]);
+            }
+        }
+        let encoded = encode(
+            &mut encoder,
+            vec![header("accept-encoding", "gzip, deflate")],
+        );
+        assert_eq!(encoded.as_ref(), &[0x90]);
+    }
+
+    #[test]
     fn test_encode_method_post() {
         let mut encoder = Encoder::default();
         let res = encode(&mut encoder, vec![method("POST")]);
@@ -457,69 +557,6 @@ mod test {
         assert_eq!(0, encoder.table.len());
         assert_eq!(0, encoder.table.size());
     }
-
-    /* TODO: needed ?
-        #[test]
-        fn test_sensitive_headers_are_never_indexed() {
-            let name = "my-password".parse().unwrap();
-            let mut value = HeaderValue::from_bytes(b"12345").unwrap();
-            value.set_sensitive(true);
-
-            let header = Header::Field {
-                name: Some(name),
-                value,
-            };
-
-            // Now, try to encode the sensitive header
-
-            let mut encoder = Encoder::default();
-            let res = encode(&mut encoder, vec![header]);
-
-            assert_eq!(&[0b10000, 0x80 | 8], &res[..2]);
-            assert_eq!("my-password", huff_decode(&res[2..10]));
-            assert_eq!(0x80 | 4, res[10]);
-            assert_eq!("12345", huff_decode(&res[11..]));
-
-            // Now, try to encode a sensitive header w/ a name in the static table
-            let name = "authorization".parse().unwrap();
-            let mut value = HeaderValue::from_bytes(b"12345").unwrap();
-            value.set_sensitive(true);
-
-            let header = Header::Field {
-                name: Some(name),
-                value,
-            };
-
-            let mut encoder = Encoder::default();
-            let res = encode(&mut encoder, vec![header]);
-
-            assert_eq!(&[0b11111, 8], &res[..2]);
-            assert_eq!(0x80 | 4, res[2]);
-            assert_eq!("12345", huff_decode(&res[3..]));
-
-            // Using the name component of a previously indexed header (without
-            // sensitive flag set)
-
-            let _ = encode(
-                &mut encoder,
-                vec![self::header("my-password", "not-so-secret")],
-            );
-
-            let name = "my-password".parse().unwrap();
-            let mut value = HeaderValue::from_bytes(b"12345").unwrap();
-            value.set_sensitive(true);
-
-            let header = Header::Field {
-                name: Some(name),
-                value,
-            };
-            let res = encode(&mut encoder, vec![header]);
-
-            assert_eq!(&[0b11111, 47], &res[..2]);
-            assert_eq!(0x80 | 4, res[2]);
-            assert_eq!("12345", huff_decode(&res[3..]));
-        }
-    */
 
     #[test]
     fn test_content_length_value_not_indexed() {
@@ -679,12 +716,12 @@ mod test {
             &mut encoder,
             vec![
                 Header::Field {
-                    name: Some(BytesStr::from_static("hello")),
-                    value: BytesStr::unchecked_from_slice(b"world"),
+                    name: Some(Bytes::from_static(b"hello")),
+                    value: Bytes::from_static(b"world"),
                 },
                 Header::Field {
                     name: None,
-                    value: BytesStr::unchecked_from_slice(b"zomg"),
+                    value: Bytes::from_static(b"zomg"),
                 },
             ],
         );
@@ -712,28 +749,57 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_evicted_overflow() {
-        // Not sure what the best way to do this is.
+        let mut encoder = Encoder::new(128, 0);
+        let mut decoder = crate::hpack::Decoder::default();
+        for sequence in 0..1024 {
+            let header = crate::hpack::Header::new(
+                Bytes::from_static(b"x-cycle"),
+                Bytes::from(format!("value-{sequence}")),
+            )
+            .unwrap();
+            let mut wire = BytesMut::new();
+            encoder.encode(std::iter::once(header.clone().into()), &mut wire);
+            decoder
+                .decode(&mut std::io::Cursor::new(&mut wire), |decoded| {
+                    assert!(decoded.value_eq(&header))
+                })
+                .unwrap();
+            let mut wire = BytesMut::new();
+            encoder.encode(
+                std::iter::once(
+                    header
+                        .clone()
+                        .with_sensitive(true)
+                        .into(),
+                ),
+                &mut wire,
+            );
+            assert_eq!(wire[0] & 0xf0, 0x10);
+            decoder
+                .decode(&mut std::io::Cursor::new(&mut wire), |decoded| {
+                    assert!(decoded.is_sensitive());
+                    assert!(decoded.value_eq(&header));
+                })
+                .unwrap();
+            assert!(encoder.table.size() <= 128);
+        }
     }
 
-    fn encode(
-        e: &mut Encoder,
-        hdrs: Vec<Header<Option<BytesStr>>>,
-    ) -> BytesMut {
+    fn encode(e: &mut Encoder, hdrs: Vec<Header<Option<Bytes>>>) -> BytesMut {
         let mut dst = BytesMut::with_capacity(1024);
         e.encode(hdrs, &mut dst);
         dst
     }
 
-    fn method(s: &str) -> Header<Option<BytesStr>> {
+    fn method(s: &str) -> Header<Option<Bytes>> {
         Header::Method(Method::from(s.as_bytes()))
     }
 
-    fn header(name: &str, val: &str) -> Header<Option<BytesStr>> {
+    fn header(name: &str, val: &str) -> Header<Option<Bytes>> {
         Header::Field {
-            name: Some(name.to_lowercase().as_str().into()),
-            value: val.into(),
+            name: Some(Bytes::from(name.to_lowercase())),
+            value: Bytes::copy_from_slice(val.as_bytes()),
         }
     }
 

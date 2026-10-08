@@ -206,12 +206,14 @@ impl Recv {
 
         // check if stream in recv data state
         if !is_ignoring_frame && !stream.state.is_recv_streaming() {
-            // TODO(hyper): There are cases where this can be a stream error of
-            // STREAM_CLOSED instead...
-            // Receiving a DATA frame when not expecting one is a protocol
-            // error.
+            // DATA after peer END_STREAM is stream-local; idle/reserved or
+            // awaiting initial response headers remains a connection error.
             error!("unexpected DATA frame| stream={:?}", stream.id);
-            return Err(ProtoError::library_go_away(Reason::PROTOCOL_ERROR));
+            return Err(if stream.state.is_recv_end_stream() {
+                ProtoError::library_reset(stream.id, Reason::STREAM_CLOSED)
+            } else {
+                ProtoError::library_go_away(Reason::PROTOCOL_ERROR)
+            });
         }
 
         if is_ignoring_frame {

@@ -1,5 +1,5 @@
 use crate::ext::Protocol;
-use crate::hpack::decoder::{DecoderError, NeedMore};
+use crate::hpack::decoder::DecoderError;
 
 use header_plz::const_headers as header;
 
@@ -10,10 +10,10 @@ use std::fmt;
 
 /// HTTP/2 Header
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Header<T = BytesStr> {
+pub enum Header<T = Bytes> {
     Field {
         name: T,
-        value: BytesStr,
+        value: Bytes,
     },
     // TODO(hyper): Change these types to `http::uri` types.
     Authority(BytesStr),
@@ -22,12 +22,14 @@ pub enum Header<T = BytesStr> {
     Path(BytesStr),
     Protocol(Protocol),
     Status(StatusCode),
+    /// Encoding policy, independent from the field bytes.
+    Sensitive(Box<Header<T>>),
 }
 
 /// The header field name
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum Name<'a> {
-    Field(&'a BytesStr),
+    Field(&'a Bytes),
     Authority,
     Method,
     Scheme,
@@ -42,17 +44,16 @@ pub struct BytesStr(Bytes);
 
 impl<'a> PartialEq<&'a str> for BytesStr {
     fn eq(&self, other: &&'a str) -> bool {
-        self.as_bytes()
-            .eq_ignore_ascii_case(other.as_bytes())
+        self.as_bytes() == other.as_bytes()
     }
 }
 
-pub fn len(name: &BytesStr, value: &BytesStr) -> usize {
+pub fn len(name: &Bytes, value: &Bytes) -> usize {
     32 + name.len() + value.len()
 }
 
-impl Header<Option<BytesStr>> {
-    pub fn reify(self) -> Result<Header, BytesStr> {
+impl Header<Option<Bytes>> {
+    pub fn reify(self) -> Result<Header, (Bytes, bool)> {
         use self::Header::*;
 
         Ok(match self {
@@ -66,7 +67,13 @@ impl Header<Option<BytesStr>> {
             Field {
                 name: None,
                 value,
-            } => return Err(value),
+            } => return Err((value, false)),
+            Sensitive(header) => {
+                return match header.reify() {
+                    Ok(header) => Ok(header.with_sensitive(true)),
+                    Err((value, _)) => Err((value, true)),
+                };
+            }
             Authority(v) => Authority(v),
             Method(v) => Method(v),
             Scheme(v) => Scheme(v),
@@ -77,15 +84,35 @@ impl Header<Option<BytesStr>> {
     }
 }
 
+impl<T> Header<T> {
+    pub fn with_sensitive(self, sensitive: bool) -> Self {
+        if sensitive && !self.is_sensitive() {
+            Self::Sensitive(Box::new(self))
+        } else {
+            self
+        }
+    }
+
+    pub fn is_sensitive(&self) -> bool {
+        matches!(self, Self::Sensitive(_))
+    }
+
+    pub fn into_unmarked(self) -> Self {
+        match self {
+            Self::Sensitive(header) => header.into_unmarked(),
+            header => header,
+        }
+    }
+}
+
 impl Header {
     pub fn new(name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
-        if name.is_empty() {
-            return Err(DecoderError::NeedMore(
-                NeedMore::UnexpectedEndOfStream,
-            ));
-        }
-        if name[0] == b':' {
-            match &name[1..] {
+        if name.first() == Some(&b':') {
+            // Typed HTTP validation is not an HPACK compression error. Keep
+            // malformed pseudoheaders as raw fields for table synchronization
+            // and reject them when assembling the complete message.
+            let raw_value = value.clone();
+            let parsed = (|| match &name[1..] {
                 b"authority" => {
                     let value = BytesStr::try_from(value)?;
                     Ok(Header::Authority(value))
@@ -111,13 +138,14 @@ impl Header {
                     Ok(Header::Status(status))
                 }
                 _ => Err(DecoderError::InvalidPseudoheader),
-            }
+            })();
+            Ok(parsed.unwrap_or_else(|_: DecoderError| Header::Field {
+                name,
+                value: raw_value,
+            }))
         } else {
             // Keep the wire bytes for HPACK table synchronization. Field
             // syntax is validated when assembling the decoded message.
-            let name = BytesStr(name);
-            let value = BytesStr(value);
-
             Ok(Header::Field {
                 name,
                 value,
@@ -129,6 +157,7 @@ impl Header {
     /// not interrupt updates to the connection's HPACK table.
     pub(crate) fn is_valid_field(&self) -> bool {
         match self {
+            Header::Sensitive(header) => header.is_valid_field(),
             Header::Field {
                 name,
                 value,
@@ -139,17 +168,27 @@ impl Header {
                     b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' |
                     b'`' | b'|' | b'~'
                 )
-            })
-                && !value
-                    .as_ref()
-                    .iter()
-                    .any(|b| matches!(b, 0 | b'\r' | b'\n')),
-            _ => true,
+            }) && valid_value(value),
+            Header::Method(method) => {
+                !method.as_ref().is_empty()
+                    && method.as_ref().iter().all(|b| {
+                        matches!(b,
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'!' | b'#' |
+                    b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
+                    b'^' | b'_' | b'`' | b'|' | b'~')
+                    })
+            }
+            Header::Authority(value)
+            | Header::Scheme(value)
+            | Header::Path(value) => valid_value(value.as_ref()),
+            Header::Protocol(value) => valid_value(value.as_ref()),
+            Header::Status(_) => true,
         }
     }
 
     pub fn len(&self) -> usize {
         match *self {
+            Header::Sensitive(ref header) => header.len(),
             Header::Field {
                 ref name,
                 ref value,
@@ -166,6 +205,7 @@ impl Header {
     /// Returns the header name
     pub fn name(&self) -> Name<'_> {
         match *self {
+            Header::Sensitive(ref header) => header.name(),
             Header::Field {
                 ref name,
                 ..
@@ -181,6 +221,7 @@ impl Header {
 
     pub fn value_slice(&self) -> &[u8] {
         match *self {
+            Header::Sensitive(ref header) => header.value_slice(),
             Header::Field {
                 ref value,
                 ..
@@ -195,7 +236,11 @@ impl Header {
     }
 
     pub fn value_eq(&self, other: &Header) -> bool {
+        if let Header::Sensitive(header) = other {
+            return self.value_eq(header);
+        }
         match *self {
+            Header::Sensitive(ref header) => header.value_eq(other),
             Header::Field {
                 ref value,
                 ..
@@ -236,19 +281,6 @@ impl Header {
         }
     }
 
-    pub fn is_sensitive(&self) -> bool {
-        false
-        /* TODO
-        match *self {
-            NHeader::Field {
-                ref value,
-                ..
-            } => value.is_sensitive(),
-            // TODO(hyper): Technically these other header values can be sensitive too.
-            _ => false,
-        } */
-    }
-
     pub fn skip_value_index(&self) -> bool {
         match *self {
             Header::Field {
@@ -276,9 +308,12 @@ impl Header {
 }
 
 // Mostly for tests
-impl From<Header> for Header<Option<BytesStr>> {
+impl From<Header> for Header<Option<Bytes>> {
     fn from(src: Header) -> Self {
         match src {
+            Header::Sensitive(header) => {
+                Header::Sensitive(Box::new((*header).into()))
+            }
             Header::Field {
                 name,
                 value,
@@ -298,30 +333,7 @@ impl From<Header> for Header<Option<BytesStr>> {
 
 impl<'a> Name<'a> {
     pub fn into_entry(self, value: Bytes) -> Result<Header, DecoderError> {
-        match self {
-            Name::Field(name) => Ok(Header::Field {
-                name: name.clone(),
-                value: BytesStr(value),
-            }),
-            Name::Authority => {
-                Ok(Header::Authority(BytesStr::try_from(value)?))
-            }
-            Name::Method => Ok(Header::Method(Method::from(value.as_ref()))),
-            Name::Scheme => Ok(Header::Scheme(BytesStr::try_from(value)?)),
-            Name::Path => Ok(Header::Path(BytesStr::try_from(value)?)),
-            Name::Protocol => {
-                {}
-                {}
-                Ok(Header::Protocol(Protocol::try_from(value)?))
-            }
-            Name::Status => {
-                match StatusCode::from_bytes(&value) {
-                    Ok(status) => Ok(Header::Status(status)),
-                    // TODO(hyper): better error handling
-                    Err(_) => Err(DecoderError::InvalidStatusCode),
-                }
-            }
-        }
+        Header::new(Bytes::copy_from_slice(self.as_slice()), value)
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -337,6 +349,98 @@ impl<'a> Name<'a> {
     }
 }
 
+/// HTTP/2 values permit opaque octets, but not controls (except interior HTAB)
+/// or leading/trailing SP and HTAB.
+fn valid_value(value: &[u8]) -> bool {
+    !matches!(value.first(), Some(b' ' | b'\t'))
+        && !matches!(value.last(), Some(b' ' | b'\t'))
+        && value
+            .iter()
+            .all(|b| *b >= 0x20 && *b != 0x7f || *b == b'\t')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regular_field_byte_policy() {
+        for value in [b"".as_slice(), b"a\tb", b"a b", b"\x80\xff"] {
+            let field = Header::new(
+                Bytes::from_static(b"x-test"),
+                Bytes::copy_from_slice(value),
+            )
+            .unwrap();
+            assert!(field.is_valid_field(), "{value:?}");
+            assert_eq!(field.value_slice(), value);
+            let _ = format!("{field:?}");
+            assert_eq!(field.len(), 38 + value.len());
+        }
+        for value in [
+            b" a".as_slice(),
+            b"a ",
+            b"\ta",
+            b"a\t",
+            b"a\0b",
+            b"a\r",
+            b"a\n",
+            b"a\x01",
+            b"a\x7f",
+        ] {
+            let field = Header::new(
+                Bytes::from_static(b"x"),
+                Bytes::copy_from_slice(value),
+            )
+            .unwrap();
+            assert!(!field.is_valid_field(), "{value:?}");
+        }
+        for name in [b"".as_slice(), b"X-test", b"x y", b"x\x80"] {
+            let field = Header::new(
+                Bytes::copy_from_slice(name),
+                Bytes::from_static(b"value"),
+            )
+            .unwrap();
+            assert!(!field.is_valid_field(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_status_paths_agree() {
+        for value in [b"abc".as_slice(), b"20", b"9999"] {
+            let literal = Header::new(
+                Bytes::from_static(b":status"),
+                Bytes::copy_from_slice(value),
+            );
+            let indexed =
+                Name::Status.into_entry(Bytes::copy_from_slice(value));
+            let literal = literal.unwrap();
+            let indexed = indexed.unwrap();
+            assert_eq!(literal, indexed);
+            assert!(!literal.is_valid_field());
+            assert_eq!(literal.name().as_slice(), b":status");
+            assert_eq!(literal.value_slice(), value);
+        }
+    }
+
+    #[test]
+    fn text_constructors_validate_utf8_and_compare_exactly() {
+        assert!(BytesStr::try_from(Bytes::from_static(b"\xff")).is_err());
+        assert!(
+            std::panic::catch_unwind(|| BytesStr::from(Bytes::from_static(
+                b"\xff"
+            )))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| BytesStr::unchecked_from_slice(
+                b"\xff"
+            ))
+            .is_err()
+        );
+        assert_ne!(BytesStr::from_static("GZIP"), "gzip");
+    }
+}
+
 // ===== impl BytesStr =====
 
 impl BytesStr {
@@ -345,7 +449,9 @@ impl BytesStr {
     }
 
     pub fn unchecked_from_slice(value: &[u8]) -> Self {
-        BytesStr(Bytes::copy_from_slice(value))
+        // Retained for compatibility; this constructor also enforces UTF-8.
+        Self::try_from(Bytes::copy_from_slice(value))
+            .expect("BytesStr requires UTF-8")
     }
 
     #[doc(hidden)]
@@ -355,8 +461,7 @@ impl BytesStr {
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        // Safety: check valid utf-8 in constructor
-        unsafe { std::str::from_utf8_unchecked(self.0.as_ref()) }
+        std::str::from_utf8(self.0.as_ref()).expect("BytesStr requires UTF-8")
     }
 
     pub(crate) fn into_inner(self) -> Bytes {
@@ -372,7 +477,7 @@ impl From<&str> for BytesStr {
 
 impl From<Bytes> for BytesStr {
     fn from(value: Bytes) -> Self {
-        BytesStr(value)
+        Self::try_from(value).expect("BytesStr requires UTF-8")
     }
 }
 

@@ -57,14 +57,13 @@ pub struct State {
 #[derive(Debug, Clone)]
 enum Inner {
     Idle,
-    // TODO(hyper): these states shouldn't count against concurrency limits:
     ReservedLocal,
     ReservedRemote,
     Open {
         local: Peer,
         remote: Peer,
     },
-    HalfClosedLocal(Peer), // TODO(hyper): explicitly name this value
+    HalfClosedLocal(Peer),
     HalfClosedRemote(Peer),
     Closed(Cause),
 }
@@ -465,7 +464,6 @@ impl State {
     }
 
     pub fn ensure_recv_open(&self) -> Result<bool, proto::ProtoError> {
-        // TODO(hyper): Is this correct?
         match self.inner {
             Closed(Cause::Error(ref e)) => Err(e.clone()),
             Closed(Cause::ScheduledLibraryReset(reason)) => {
@@ -477,32 +475,122 @@ impl State {
             _ => Ok(true),
         }
     }
+}
 
-    /* TODO
-    /// Returns a reason if the stream has been reset.
-    pub(super) fn ensure_reason(
-        &self,
-        mode: PollReset,
-    ) -> Result<Option<Reason>, crate::Error> {
-        match self.inner {
-            Closed(Cause::Error(Error::Reset(_, reason, _)))
-            | Closed(Cause::Error(Error::GoAway(_, reason, _)))
-            | Closed(Cause::ScheduledLibraryReset(reason)) => Ok(Some(reason)),
-            Closed(Cause::Error(ref e)) => Err(e.clone().into()),
-            Open {
-                local: Streaming,
-                ..
-            }
-            | HalfClosedRemote(Streaming) => match mode {
-                PollReset::AwaitingHeaders => {
-                    Err(UserError::PollResetAfterSendResponse.into())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_eligibility_and_reset_matrix() {
+        let id = StreamId::from(1);
+        let states = vec![
+            (Idle, false, false),
+            (ReservedLocal, false, false),
+            (ReservedRemote, false, false),
+            (
+                Open {
+                    local: AwaitingHeaders,
+                    remote: AwaitingHeaders,
+                },
+                false,
+                false,
+            ),
+            (
+                Open {
+                    local: Streaming,
+                    remote: Streaming,
+                },
+                true,
+                false,
+            ),
+            (HalfClosedLocal(AwaitingHeaders), false, false),
+            (HalfClosedLocal(Streaming), true, false),
+            (HalfClosedRemote(AwaitingHeaders), false, true),
+            (HalfClosedRemote(Streaming), false, true),
+            (Closed(Cause::EndStream), false, true),
+            (
+                Closed(Cause::Error(ProtoError::remote_reset(
+                    id,
+                    Reason::CANCEL,
+                ))),
+                false,
+                false,
+            ),
+            (
+                Closed(Cause::Error(ProtoError::library_reset(
+                    id,
+                    Reason::CANCEL,
+                ))),
+                false,
+                false,
+            ),
+            (
+                Closed(Cause::ScheduledLibraryReset(Reason::CANCEL)),
+                false,
+                false,
+            ),
+        ];
+        for (inner, data_allowed, peer_ended) in states {
+            let state = State {
+                inner,
+            };
+            assert_eq!(state.is_recv_streaming(), data_allowed, "{state:?}");
+            assert_eq!(state.is_recv_end_stream(), peer_ended, "{state:?}");
+            for queued in [false, true] {
+                let mut reset = state.clone();
+                let was_closed = reset.is_closed();
+                reset
+                    .recv_reset(frame::Reset::new(id, Reason::CANCEL), queued);
+                assert!(reset.is_closed());
+                if queued || !was_closed {
+                    assert!(reset.is_remote_reset());
                 }
-                PollReset::Streaming => Ok(None),
-            },
-            _ => Ok(None),
+                reset.recv_eof();
+                assert!(reset.is_closed());
+            }
         }
     }
-    */
+
+    #[test]
+    fn receive_open_eof_and_reset_characterization() {
+        for (inner, recv_open) in [
+            (Idle, true),
+            (
+                Open {
+                    local: Streaming,
+                    remote: Streaming,
+                },
+                true,
+            ),
+            (HalfClosedLocal(Streaming), true),
+            (HalfClosedRemote(Streaming), false),
+            (ReservedLocal, false),
+            (ReservedRemote, true),
+            (Closed(Cause::EndStream), false),
+        ] {
+            let mut state = State {
+                inner,
+            };
+            assert_eq!(state.ensure_recv_open().unwrap(), recv_open);
+            state.recv_eof();
+            assert!(state.is_closed());
+            state.recv_eof();
+            assert!(state.is_closed());
+        }
+        let mut state = State::default();
+        state.recv_reset(
+            frame::Reset::new(StreamId::from(1), Reason::CANCEL),
+            false,
+        );
+        assert!(state.is_remote_reset());
+        assert!(state.ensure_recv_open().is_err());
+        state.recv_eof();
+        assert!(
+            state.is_remote_reset(),
+            "EOF must retain the peer reset reason"
+        );
+    }
 }
 
 impl Default for State {

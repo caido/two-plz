@@ -5,27 +5,13 @@ use support::prelude::*;
 // http_2_request_without_scheme_or_authority
 // connection_close_notifies_client_poll_ready
 
-trait MockH2 {
-    fn local_handshake(&mut self) -> &mut Self;
-}
-
-impl MockH2 for mock_io::Builder {
-    fn local_handshake(&mut self) -> &mut Self {
-        self.write(MAGIC_PREFACE)
-            // Settings frame
-            .write(frames::NEW_SETTINGS)
-            .read(frames::SETTINGS)
-            .write(frames::SETTINGS_ACK)
-            .read(frames::SETTINGS_ACK)
-    }
-}
-
 #[tokio::test]
 async fn client_handshake() {
     support::trace_init!();
 
     let mock = mock_io::Builder::new()
-        .local_handshake()
+        .client_handshake()
+        .read(frames::SETTINGS_ACK)
         .build();
 
     let (conn, _client) = ClientBuilder::new()
@@ -222,7 +208,8 @@ async fn recv_invalid_server_stream_id() {
     support::trace_init!();
 
     let io = mock_io::Builder::new()
-        .local_handshake()
+        .client_handshake()
+        .read(frames::SETTINGS_ACK)
         // Write GET /
         .write(&[
             0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29,
@@ -249,34 +236,49 @@ async fn recv_invalid_server_stream_id() {
     assert!(response.await.is_err());
 }
 
-/*
-// TODO(init): fix - client - initial_stream_id
-#[ignore]
+#[test]
+fn initial_stream_id_rejects_invalid_ids() {
+    for id in [0, 2, 0x7fff_fffe, 0x8000_0001, u32::MAX] {
+        assert!(
+            std::panic::catch_unwind(|| {
+                ClientBuilder::new().initial_stream_id(id)
+            })
+            .is_err(),
+            "accepted invalid initial stream ID {id}"
+        );
+    }
+}
+
+#[test]
+fn initial_stream_id_accepts_valid_ids() {
+    for id in [1, 5, 0x7fff_ffff] {
+        let _ = ClientBuilder::new().initial_stream_id(id);
+    }
+}
+
 #[tokio::test]
 async fn request_stream_id_overflows() {
     support::trace_init!();
     let (io, mut srv) = mock::new();
+    let (handshake_tx, handshake_rx) = tokio::sync::oneshot::channel();
 
     let client_fut = async move {
         let (mut conn, mut client) = ClientBuilder::new()
-            //.initial_stream_id(u32::MAX >> 1)
+            .initial_stream_id(u32::MAX >> 1)
             .handshake(io)
             .await
             .unwrap();
+        conn.drive(handshake_rx).await.unwrap();
         let request = build_test_request();
         let resp = client.send_request(request).unwrap();
         let _r = conn.drive(resp).await.unwrap();
 
-        // second cannot use the next stream id, it's over
-        // let poll_err = poll_fn(|cx| client.poll_ready(cx)).await.unwrap_err();
-        // assert_eq!(poll_err.to_string(), "user error: stream ID overflowed");
-
+        // The largest legal ID was consumed; the next request must fail.
         let request = build_test_request();
         let err = client
             .send_request(request)
-            .unwrap()
-            .await
-            .unwrap_err();
+            .err()
+            .expect("stream ID overflow");
 
         assert_eq!(err.to_string(), "user error: stream ID overflowed");
     };
@@ -284,10 +286,11 @@ async fn request_stream_id_overflows() {
     let srv_fut = async move {
         let settings = srv.assert_client_handshake().await;
         assert_default_settings!(settings);
+        handshake_tx.send(()).unwrap();
 
         srv.recv_frame(
             frames::headers(u32::MAX >> 1)
-                .request("GET", "https", "example.com", "/")
+                .request("GET", "https", "http2.akamai.com", "/")
                 .eos(),
         )
         .await;
@@ -302,7 +305,6 @@ async fn request_stream_id_overflows() {
 
     join(client_fut, srv_fut).await;
 }
-*/
 
 #[tokio::test]
 async fn client_builder_max_concurrent_streams() {

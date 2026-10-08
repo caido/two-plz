@@ -7,13 +7,17 @@ license = "MIT"
 [workspace]
 members = ["tests/two-tests", "tests/support"]
 
+# Use one header type across direct and transitive dependencies.
+[patch.crates-io]
+header-plz = { git = "ssh://git@github.com/caido/primitives.git", rev = "67d43e6e912272e12561db5bfa40f6067bb9bd78" }
+
 [dependencies]
 bytes = "1.11.0"
 fnv = "1.0.7"
 futures = { version = "0.3.31", default-features = false, features = ["std"] }
 futures-core = { version = "0.3.31", default-features = false }
 futures-sink = { version = "0.3.31", default-features = false }
-header-plz = "0.0.50"
+header-plz = { git = "ssh://git@github.com/caido/primitives.git", rev = "67d43e6e912272e12561db5bfa40f6067bb9bd78" }
 indexmap = { version = "2.2.6", features = ["std"] }
 slab = "0.4.11"
 thiserror = "2.0.17"

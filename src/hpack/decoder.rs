@@ -6,7 +6,6 @@ use header_plz::Method;
 use header_plz::const_headers as header;
 use header_plz::status::{InvalidStatusCode, StatusCode};
 
-use std::cmp;
 use std::collections::VecDeque;
 use std::io::Cursor;
 use std::str::Utf8Error;
@@ -16,7 +15,10 @@ use std::str::Utf8Error;
 pub struct Decoder {
     // Protocol indicated that the max table size will update
     max_size_update: Option<usize>,
+    // Smallest acknowledged reduction not yet signaled by the encoder.
+    required_size_update: Option<usize>,
     last_max_update: usize,
+    can_resize: bool,
     table: Table,
     buffer: BytesMut,
 }
@@ -155,7 +157,9 @@ impl Decoder {
     pub fn new(size: usize) -> Decoder {
         Decoder {
             max_size_update: None,
+            required_size_update: None,
             last_max_update: size,
+            can_resize: true,
             table: Table::new(size),
             buffer: BytesMut::with_capacity(4096),
         }
@@ -164,16 +168,51 @@ impl Decoder {
     /// Queues a potential size update
     #[allow(dead_code)]
     pub fn queue_size_update(&mut self, size: usize) {
-        let size = match self.max_size_update {
-            Some(v) => cmp::max(v, size),
-            None => size,
-        };
-
+        // The last acknowledged SETTINGS value is the ceiling (RFC 7541
+        // section 6.3). Retain intervening reductions separately so a later
+        // increase cannot hide the eviction required by section 4.2.
+        if size < self.table.max_size {
+            self.required_size_update = Some(
+                self.required_size_update
+                    .map_or(size, |previous| previous.min(size)),
+            );
+        }
         self.max_size_update = Some(size);
     }
 
-    /// Decodes the headers found in the given buffer.
+    /// Starts a header block. CONTINUATION fragments must not restart it.
+    pub fn begin_block(&mut self) {
+        self.can_resize = true;
+        if let Some(size) = self.max_size_update.take() {
+            self.last_max_update = size;
+        }
+    }
+
+    /// Checks requirements that also apply to an empty completed block.
+    pub fn end_block(&self) -> Result<(), DecoderError> {
+        if self.required_size_update.is_some() {
+            Err(DecoderError::InvalidMaxDynamicSize)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Decodes a complete header block, starting fresh block-local state.
     pub fn decode<F>(
+        &mut self,
+        src: &mut Cursor<&mut BytesMut>,
+        f: F,
+    ) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header),
+    {
+        self.begin_block();
+        self.decode_fragment(src, f)?;
+        self.end_block()
+    }
+
+    /// Decodes a fragment while preserving block-local resize eligibility.
+    pub fn decode_fragment<F>(
         &mut self,
         src: &mut Cursor<&mut BytesMut>,
         mut f: F,
@@ -182,12 +221,6 @@ impl Decoder {
         F: FnMut(Header),
     {
         use self::Representation::*;
-
-        let mut can_resize = true;
-
-        if let Some(size) = self.max_size_update.take() {
-            self.last_max_update = size;
-        }
 
         let span = tracing::trace_span!("hpack::decode");
         let _e = span.enter();
@@ -198,18 +231,24 @@ impl Decoder {
             // At this point we are always at the beginning of the next block
             // within the HPACK data. The type of the block can always be
             // determined from the first byte.
-            match Representation::load(ty)? {
+            let representation = Representation::load(ty)?;
+            if self.required_size_update.is_some()
+                && !matches!(representation, SizeUpdate)
+            {
+                return Err(DecoderError::InvalidMaxDynamicSize);
+            }
+            match representation {
                 Indexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"Indexed");
-                    can_resize = false;
                     let entry = self.decode_indexed(src)?;
+                    self.can_resize = false;
                     consume(src);
                     f(entry);
                 }
                 LiteralWithIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
-                    can_resize = false;
                     let entry = self.decode_literal(src, true)?;
+                    self.can_resize = false;
 
                     // Insert the header into the table
                     self.table.insert(entry.clone());
@@ -219,24 +258,24 @@ impl Decoder {
                 }
                 LiteralWithoutIndexing => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
-                    can_resize = false;
                     let entry = self.decode_literal(src, false)?;
+                    self.can_resize = false;
                     consume(src);
                     f(entry);
                 }
                 LiteralNeverIndexed => {
                     tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
-                    can_resize = false;
                     let entry = self.decode_literal(src, false)?;
+                    self.can_resize = false;
                     consume(src);
 
-                    // TODO(hyper): Track that this should never be indexed
+                    let entry = entry.with_sensitive(true);
 
                     f(entry);
                 }
                 SizeUpdate => {
                     tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
-                    if !can_resize {
+                    if !self.can_resize {
                         return Err(DecoderError::InvalidMaxDynamicSize);
                     }
 
@@ -256,9 +295,14 @@ impl Decoder {
     ) -> Result<(), DecoderError> {
         let new_size = decode_int(buf, 5)?;
 
-        if new_size > self.last_max_update {
+        if new_size > self.last_max_update
+            || self
+                .required_size_update
+                .is_some_and(|minimum| new_size > minimum)
+        {
             return Err(DecoderError::InvalidMaxDynamicSize);
         }
+        self.required_size_update = None;
 
         tracing::debug!(
             from = self.table.size(),
@@ -393,7 +437,8 @@ impl Representation {
         const SIZE_UPDATE_MASK: u8 = 0b1110_0000;
         const SIZE_UPDATE: u8 = 0b0010_0000;
 
-        // TODO(hyper): What did I even write here?
+        // RFC 7541 section 6 prefixes: 1, 01, 0000, 0001, and 001.
+        // Test the leading tag bits; remaining bits encode the integer.
 
         if byte & INDEXED == INDEXED {
             Ok(Representation::Indexed)
@@ -602,38 +647,15 @@ impl Table {
 
 impl From<Utf8Error> for DecoderError {
     fn from(_: Utf8Error) -> DecoderError {
-        // TODO(hyper): Better error?
+        // Text-only header components must be valid UTF-8; ordinary field
+        // values remain opaque bytes and do not use this conversion.
         DecoderError::InvalidUtf8
     }
 }
-
-/* TODO: needed ?
-impl From<header::InvalidHeaderValue> for NDecoderError {
-    fn from(_: header::InvalidHeaderValue) -> NDecoderError {
-        // TODO(hyper): Better error?
-        NDecoderError::InvalidUtf8
-    }
-}
-
-impl From<header::InvalidHeaderName> for NDecoderError {
-    fn from(_: header::InvalidHeaderName) -> NDecoderError {
-        // TODO(hyper): Better error
-        NDecoderError::InvalidUtf8
-    }
-}
-
-impl From<method::InvalidMethod> for NDecoderError {
-    fn from(_: method::InvalidMethod) -> NDecoderError {
-        // TODO(hyper): Better error
-        NDecoderError::InvalidUtf8
-    }
-}
-*/
 
 impl From<InvalidStatusCode> for DecoderError {
     fn from(_: InvalidStatusCode) -> DecoderError {
-        // TODO(hyper): Better error
-        DecoderError::InvalidUtf8
+        DecoderError::InvalidStatusCode
     }
 }
 
@@ -713,8 +735,8 @@ pub fn get_static(idx: usize) -> Header {
             };
 
             Header::Field {
-                name: BytesStr::unchecked_from_slice(name),
-                value: BytesStr::from_static(value),
+                name: Bytes::copy_from_slice(name),
+                value: Bytes::from_static(value.as_bytes()),
             }
         }
     }

@@ -159,7 +159,7 @@ where
     /// `poll_ready` must be called first to ensure that a frame may be
     /// accepted.
     ///
-    /// TODO(hyper): Rename this to avoid conflicts with Sink::buffer
+    /// TODO(hyper): Consider an API rename; this name overlaps `Sink::buffer`.
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         self.framed_write().buffer(item)
     }
@@ -237,7 +237,7 @@ where
     }
 }
 
-// TODO(hyper): remove (or improve) this
+// TODO(hyper): Revisit this conversion only with an approved compatibility plan.
 impl<T> From<T> for Codec<T, bytes::Bytes>
 where
     T: AsyncRead + AsyncWrite + Unpin,

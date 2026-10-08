@@ -1,0 +1,9 @@
+{
+  "source": "RFC 7541, May 2015, C.4.1-C.4.3",
+  "header_table_size": 4096,
+  "cases": [
+    {"seqno":0,"wire":"828684418cf1e3c2e5f23a6ba0ab90f4ff","headers":[{":method":"GET"},{":scheme":"http"},{":path":"/"},{":authority":"www.example.com"}]},
+    {"seqno":1,"wire":"828684be5886a8eb10649cbf","headers":[{":method":"GET"},{":scheme":"http"},{":path":"/"},{":authority":"www.example.com"},{"cache-control":"no-cache"}]},
+    {"seqno":2,"wire":"828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf","headers":[{":method":"GET"},{":scheme":"https"},{":path":"/index.html"},{":authority":"www.example.com"},{"custom-key":"custom-value"}]}
+  ]
+}

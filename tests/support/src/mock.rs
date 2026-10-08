@@ -316,8 +316,9 @@ impl Handle {
                 Frame::Settings(settings) => {
                     // Send the ACK
                     let ack = frame::Settings::ack();
-                    // TODO: Don't unwrap?
-                    self.send(ack.into()).await.unwrap();
+                    self.send(ack.into()).await.expect(
+                        "failed to send SETTINGS ACK during client handshake",
+                    );
 
                     settings
                 }
@@ -385,8 +386,9 @@ impl Handle {
 
         // Send the ACK
         let ack = frame::Settings::ack();
-        // TODO: Don't unwrap?
-        self.send(ack.into()).await.unwrap();
+        self.send(ack.into())
+            .await
+            .expect("failed to send SETTINGS ACK during server handshake");
 
         // read ack
         let frame = self.next().await;

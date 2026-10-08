@@ -57,7 +57,7 @@ pub use super::future_ext::{
 };
 
 // Our client_ext helpers
-pub use super::client_ext::SendRequestExt;
+pub use super::client_ext::{MockClientHandshake, SendRequestExt};
 
 // Re-export HTTP types
 pub use header_plz::{
@@ -75,28 +75,6 @@ pub use std::time::Duration;
 pub use frame::Reason;
 
 pub static MAGIC_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
-// ===== Everything under here shouldn't be used =====
-// TODO(hyper): work on deleting this code
-
-pub trait MockH2 {
-    fn handshake(&mut self) -> &mut Self;
-
-    fn handshake_read_settings(&mut self, settings: &[u8]) -> &mut Self;
-}
-
-impl MockH2 for tokio_test::io::Builder {
-    fn handshake(&mut self) -> &mut Self {
-        self.handshake_read_settings(frames::SETTINGS)
-    }
-
-    fn handshake_read_settings(&mut self, settings: &[u8]) -> &mut Self {
-        self.write(MAGIC_PREFACE)
-            .write(frames::NEW_SETTINGS)
-            .read(settings)
-            .write(frames::SETTINGS_ACK)
-    }
-}
 
 pub trait ClientExt {
     fn run<'a, F: Future + Unpin + 'a>(

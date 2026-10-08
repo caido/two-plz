@@ -9,7 +9,7 @@ async fn send_recv_headers_only() {
     support::trace_init!();
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         // Write GET /
         .write(&[
             0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29,
@@ -39,7 +39,7 @@ async fn send_recv_data() {
     support::trace_init!();
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         .write(&[
             // POST /
             0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75,
@@ -76,7 +76,7 @@ async fn send_headers_recv_data_single_frame() {
     support::trace_init!();
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         // Write GET /
         .write(&[
             0, 0, 16, 1, 5, 0, 0, 0, 1, 130, 135, 65, 139, 157, 41, 172, 75,
@@ -186,8 +186,8 @@ async fn reset_streams_dont_grow_memory_continuously() {
         poll_fn(|cx| s.poll_closed(cx))
             .await
             .expect_err("server should error");
-        // specifically, not 50;
-        assert_eq!(21, s.num_wired_streams());
+        // Terminal closure discards unaccepted requests, including reset ones.
+        assert_eq!(0, s.num_wired_streams());
     };
 
     join(client, srv).await;
@@ -506,19 +506,19 @@ async fn recv_goaway_with_higher_last_processed_id() {
     join(srv_fut, client_fut).await;
 }
 
-// TODO(init): initial_stream_id
-#[ignore]
 #[tokio::test]
 async fn skipped_stream_ids_are_implicitly_closed() {
     support::trace_init!();
     let (io, mut srv) = mock::new();
+    let (handshake_tx, handshake_rx) = tokio::sync::oneshot::channel();
 
     let client_fut = async move {
         let (mut conn, mut client) = ClientBuilder::new()
-            //.initial_stream_id(5)
+            .initial_stream_id(5)
             .handshake(io)
             .await
             .unwrap();
+        conn.drive(handshake_rx).await.unwrap();
 
         let req = async move {
             let request = build_test_request();
@@ -535,8 +535,9 @@ async fn skipped_stream_ids_are_implicitly_closed() {
     let srv_fut = async move {
         let settings = srv.assert_client_handshake().await;
         assert_default_settings!(settings);
+        handshake_tx.send(()).unwrap();
         srv.recv_frame(
-            frames::headers(1)
+            frames::headers(5)
                 .request("GET", "https", "http2.akamai.com", "/")
                 .eos(),
         )
@@ -699,85 +700,83 @@ async fn rst_stream_expires() {
     join(srv_fut, client_fut).await;
 }
 
-/*
-// TODO(support) - max_concurrent_reset_streams ?
-// #[tokio::test]
-async fn rst_stream_max() {
+#[tokio::test]
+async fn rst_stream_max_retains_oldest_and_declines_new() {
     support::trace_init!();
     let (io, mut srv) = mock::new();
+    let (cancel1_tx, cancel1_rx) = oneshot::channel();
+    let (cancel3_tx, cancel3_rx) = oneshot::channel();
+    let (reset3_tx, reset3_rx) = oneshot::channel();
     let client_fut = async move {
-        let (conn, mut client) = ClientBuilder::new()
+        let (mut conn, mut client) = ClientBuilder::new()
             .max_concurrent_reset_streams(1)
+            .reset_stream_duration(Duration::from_secs(60))
             .handshake(io)
             .await
             .unwrap();
-
-        let mut client_clone = client.clone();
-        let req1 = async move {
-            let request = build_test_request();
-            let resp = client_clone
-                .send_request(request)
-                .unwrap();
-            drop(resp);
-        };
-
-        let req2 = async move {
-            let request = build_test_request();
-            let resp = client.send_request(request).unwrap();
-            drop(resp);
-        };
-
-        let mut conn = Box::pin(async move {
-            conn.await.expect("client");
-        });
-        conn.drive(join(req1, req2)).await;
-        conn.await;
+        let response1 = client
+            .send_request(build_test_request())
+            .unwrap();
+        let response3 = client
+            .send_request(build_test_request())
+            .unwrap();
+        conn.drive(cancel1_rx).await.unwrap();
+        drop(response1);
+        conn.drive(cancel3_rx).await.unwrap();
+        drop(response3);
+        conn.drive(reset3_rx).await.unwrap();
+        let response5 = client
+            .send_request(build_test_request())
+            .unwrap();
+        assert_eq!(
+            conn.drive(response5)
+                .await
+                .unwrap()
+                .status(),
+            &StatusCode::OK
+        );
+        drop(client);
+        conn.await
+            .expect("client connection remains usable after reset limit");
     };
-
     let srv_fut = async move {
-        let settings = srv.assert_client_handshake().await;
-        assert_default_settings!(settings);
-        srv.recv_frame(
-            frames::headers(1)
-                .request("GET", "https", "http2.akamai.com", "/")
-                .eos(),
-        )
-        .await;
-        srv.recv_frame(
-            frames::headers(3)
-                .request("GET", "https", "http2.akamai.com", "/")
-                .eos(),
-        )
-        .await;
-        srv.send_frame(frames::headers(1).response(200))
+        assert_default_settings!(srv.assert_client_handshake().await);
+        for id in [1, 3] {
+            srv.recv_frame(
+                frames::headers(id)
+                    .request("GET", "https", "http2.akamai.com", "/")
+                    .eos(),
+            )
             .await;
-        srv.send_frame(frames::data(1, vec![0; 16]))
-            .await;
-        srv.send_frame(frames::headers(3).response(200))
-            .await;
-        srv.send_frame(frames::data(3, vec![0; 16]))
-            .await;
+        }
+        cancel1_tx.send(()).unwrap();
         srv.recv_frame(frames::reset(1).cancel())
             .await;
+        cancel3_tx.send(()).unwrap();
         srv.recv_frame(frames::reset(3).cancel())
             .await;
-        // sending frame after canceled!
-        // olders streams trump newer streams
-        // 1 is still being ignored
+        reset3_tx.send(()).unwrap();
+        srv.recv_frame(
+            frames::headers(5)
+                .request("GET", "https", "http2.akamai.com", "/")
+                .eos(),
+        )
+        .await;
+        // The full retention queue keeps stream 1; it does not evict it for 3.
         srv.send_frame(frames::data(1, vec![0; 16]).eos())
             .await;
-        // ping pong to be sure of no goaway
         srv.ping_pong([1; 8]).await;
-        // 3 has been evicted, will get a reset
+        // Stream 3 was never retained. Late DATA is a stream-local error.
         srv.send_frame(frames::data(3, vec![0; 16]).eos())
             .await;
         srv.recv_frame(frames::reset(3).stream_closed())
             .await;
+        srv.ping_pong([2; 8]).await;
+        srv.send_frame(frames::headers(5).response(200).eos())
+            .await;
     };
-
     join(srv_fut, client_fut).await;
 }
-*/
 
 #[tokio::test]
 async fn rst_while_closing() {
@@ -1018,10 +1017,91 @@ async fn send_err_with_buffered_data() {
     join(srv_fut, client_fut).await;
 }
 
-// TODO(pp)
-#[ignore]
 #[tokio::test]
-async fn srv_window_update_on_lower_stream_id() {}
+async fn srv_window_update_on_lower_stream_id() {
+    support::trace_init!();
+    let (io, mut client) = mock::new();
+    let server_fut = async move {
+        let mut server = ServerBuilder::new()
+            .handshake(io)
+            .await
+            .unwrap();
+        let (_, mut response1) = server.accept().await.unwrap().unwrap();
+        response1
+            .send_response(build_test_response())
+            .unwrap();
+        drop(response1);
+        let (_, mut response5) = server.accept().await.unwrap().unwrap();
+        assert_eq!(response5.stream_id(), 5u32);
+        let mut response = build_test_response();
+        response.set_body(BytesMut::zeroed(65_537));
+        response5
+            .send_response(response)
+            .unwrap();
+        assert!(server.accept().await.is_none());
+    };
+    let client_fut = async move {
+        client
+            .assert_server_handshake_with_settings(
+                frames::settings().initial_window_size(0),
+            )
+            .await;
+        client
+            .send_frame(
+                frames::headers(1)
+                    .request("GET", "https", "example.com", "/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
+        // Opening 5 implicitly closes skipped 3; 1 is already fully closed.
+        client
+            .send_frame(
+                frames::headers(5)
+                    .request("GET", "https", "example.com", "/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(5).response(200))
+            .await;
+        for id in [1, 3] {
+            client
+                .send_frame(frames::window_update(id, 65_535))
+                .await;
+        }
+        // No DATA may precede this ACK: lower IDs cannot grant stream 5 credit.
+        client.ping_pong([3; 8]).await;
+        client
+            .send_frame(frames::window_update(5, 65_535))
+            .await;
+        for len in [16_384, 16_384, 16_384, 16_383] {
+            client
+                .recv_frame(frames::data(5, vec![0; len]))
+                .await;
+        }
+        // Connection credit is now exhausted. Lower-ID updates cannot replenish it.
+        for id in [1, 3] {
+            client
+                .send_frame(frames::window_update(id, 2))
+                .await;
+        }
+        client
+            .send_frame(frames::window_update(5, 2))
+            .await;
+        client.ping_pong([4; 8]).await;
+        client
+            .send_frame(frames::window_update(0, 2))
+            .await;
+        client
+            .recv_frame(frames::data(5, vec![0; 2]).eos())
+            .await;
+        client.ping_pong([5; 8]).await;
+    };
+    join(server_fut, client_fut).await;
+}
 
 #[tokio::test]
 async fn reset_new_stream_before_send() {

@@ -213,12 +213,14 @@ impl Counts {
     /// If the stream state transitions to closed, this function will perform
     /// all necessary cleanup.
     ///
-    /// TODO(hyper): Is this function still needed?
+    /// This wrapper preserves pre-transition reset-queue membership so cleanup
+    /// can decrement the corresponding count after the action runs.
     pub fn transition<F, U>(&mut self, mut stream: Ptr, f: F) -> U
     where
         F: FnOnce(&mut Self, &mut Ptr) -> U,
     {
-        // TODO(hyper): Does this need to be computed before performing the action?
+        // Keep the old queue membership: the action may remove reset retention,
+        // but transition_after must still decrement its previously counted slot.
         let is_pending_reset = stream.is_pending_reset_expiration();
 
         // Run the action
@@ -229,7 +231,6 @@ impl Counts {
         ret
     }
 
-    // TODO(hyper): move this to macro?
     pub fn transition_after(
         &mut self,
         mut stream: Ptr,
@@ -267,6 +268,110 @@ impl Counts {
         } else {
             trace!("stream not released");
         }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use crate::proto::streams::{store::Store, stream::Stream};
+
+    #[cfg(test)]
+    pub(crate) fn single_slot(role: Role) -> Counts {
+        Counts {
+            role,
+            max_send_streams: 1,
+            num_send_streams: 0,
+            max_recv_streams: 1,
+            num_recv_streams: 0,
+            max_local_reset_streams: 1,
+            num_local_reset_streams: 0,
+            max_remote_reset_streams: 1,
+            num_remote_reset_streams: 0,
+            max_local_error_reset_streams: None,
+            num_local_error_reset_streams: 0,
+        }
+    }
+
+    #[test]
+    fn reservation_activation_counts_are_symmetric() {
+        for role in [Role::Server, Role::Client] {
+            let mut counts = Counts {
+                role: role.clone(),
+                max_send_streams: 1,
+                num_send_streams: 0,
+                max_recv_streams: 1,
+                num_recv_streams: 0,
+                max_local_reset_streams: 1,
+                num_local_reset_streams: 0,
+                max_remote_reset_streams: 1,
+                num_remote_reset_streams: 0,
+                max_local_error_reset_streams: None,
+                num_local_error_reset_streams: 0,
+            };
+            let mut store = Store::new();
+            let id = frame::StreamId::from(2);
+            let mut stream = Stream::new(id, 10, 10);
+            if role.is_server() {
+                stream.state.reserve_local().unwrap();
+            } else {
+                stream.state.reserve_remote().unwrap();
+            }
+            let mut stream = store.insert(id, stream);
+            assert!(!stream.is_counted);
+            assert!(!counts.has_streams());
+            if role.is_server() {
+                stream.state.send_open(false).unwrap();
+                counts.inc_num_send_streams(&mut stream);
+                assert!(!counts.can_inc_num_send_streams());
+            } else {
+                let headers = frame::Headers::new(
+                    id,
+                    frame::headers::Pseudo::default(),
+                    header_plz::HeaderMap::new(),
+                );
+                assert!(
+                    stream
+                        .state
+                        .recv_open(&headers)
+                        .unwrap()
+                );
+                counts.inc_num_recv_streams(&mut stream);
+                assert!(!counts.can_inc_num_recv_streams());
+            }
+            assert!(counts.has_streams());
+            counts.transition(stream, |_, stream| stream.state.recv_eof());
+            assert!(!counts.has_streams());
+            assert_eq!(store.num_wired_streams(), 0);
+        }
+    }
+
+    #[test]
+    fn transition_uses_pre_action_reset_membership() {
+        let mut counts = Counts {
+            role: Role::Server,
+            max_send_streams: 1,
+            num_send_streams: 0,
+            max_recv_streams: 1,
+            num_recv_streams: 0,
+            max_local_reset_streams: 1,
+            num_local_reset_streams: 1,
+            max_remote_reset_streams: 1,
+            num_remote_reset_streams: 0,
+            max_local_error_reset_streams: None,
+            num_local_error_reset_streams: 0,
+        };
+        let mut store = Store::new();
+        let id = frame::StreamId::from(1);
+        let mut stream = Stream::new(id, 10, 10);
+        stream
+            .state
+            .recv_reset(frame::Reset::new(id, frame::Reason::CANCEL), false);
+        stream.reset_at = Some(std::time::Instant::now());
+        let stream = store.insert(id, stream);
+        counts.transition(stream, |_, stream| stream.reset_at = None);
+        assert_eq!(counts.num_local_reset_streams, 0);
+        assert_eq!(store.num_wired_streams(), 0);
     }
 }
 

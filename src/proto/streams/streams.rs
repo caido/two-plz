@@ -46,8 +46,6 @@ pub(crate) struct Streams<B> {
     /// bit of unsafe code. This optimization has been postponed until it has
     /// been shown to be necessary.
     send_buffer: Arc<SendBuffer<B>>,
-    // TODO: Why ?
-    //_p: ::std::marker::PhantomData<P>,
 }
 
 impl Streams<Bytes> {
@@ -148,8 +146,8 @@ impl Streams<Bytes> {
         // closed state.
         debug_assert!(!stream.state.is_closed());
 
-        // TODO(hyper): ideally, OpaqueStreamRefs::new would do this, but we're
-        // holding the lock, so it can't.
+        // Increment while holding the state lock so the reference count stays
+        // synchronized with stream creation.
         me.refs += 1;
 
         Ok(OpaqueStreamRef::new(self.inner.clone(), &mut stream))
@@ -260,8 +258,8 @@ impl Streams<Bytes> {
                     stream.id,
                     stream.state
                 );
-                // TODO(hyper): ideally, OpaqueStreamRefs::new would do this, but
-                // we're holding the lock, so it can't.
+                // Increment under the state lock to keep reference tracking
+                // synchronized with accepting the stream.
                 me.refs += 1;
 
                 // Pending-accepted remotely-reset streams are counted.
@@ -541,7 +539,6 @@ impl<B> Clone for Streams<B> {
         Streams {
             inner: self.inner.clone(),
             send_buffer: self.send_buffer.clone(),
-            //_p: ::std::marker::PhantomData,
         }
     }
 }

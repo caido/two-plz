@@ -96,7 +96,7 @@ async fn client_settings_header_table_size() {
 
     let io = mock_io::Builder::new()
         // Read SETTINGS_HEADER_TABLE_SIZE = 0
-        .handshake_read_settings(&[
+        .client_handshake_with_settings(&[
             0, 0, 6, // len
             4, // type
             0, // flags

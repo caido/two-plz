@@ -99,15 +99,7 @@ impl CaptainCrypto {
             trace!("untrusted");
             &self.untrusted_ca.store()
         };
-        cert_store
-            .iter()
-            .find_map(|(digest, config)| {
-                if digest.as_slice() == digest_to_check {
-                    Some(config.clone())
-                } else {
-                    None
-                }
-            })
+        cert_store.get(digest_to_check).cloned()
     }
 
     /* Description:

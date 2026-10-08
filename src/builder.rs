@@ -60,6 +60,9 @@ pub struct Builder<R> {
 
     pub role: R,
 
+    #[cfg(feature = "test-util")]
+    pub(crate) initial_stream_id: StreamId,
+
     /// Initial `Settings` frame to send as part of the handshake.
     pub settings: frame::Settings,
 
@@ -97,6 +100,8 @@ where
             ),
             settings,
             role: R::role_opts(),
+            #[cfg(feature = "test-util")]
+            initial_stream_id: R::init_stream_id(),
             max_recv_buffer_size: usize::MAX,
         }
     }
@@ -202,13 +207,14 @@ where
     /// to implement the behavior. This state grows linearly with the number of
     /// streams that are locally reset.
     ///
-    /// The `max_concurrent_reset_streams` setting configures sets an upper
-    /// bound on the amount of state that is maintained. When this max value is
-    /// reached, the oldest reset stream is purged from memory.
+    /// The `max_concurrent_reset_streams` setting bounds the number of resets
+    /// retained for this grace period. When the limit is reached, existing
+    /// retained streams remain in the queue and newly reset streams are not
+    /// retained. A value of zero disables this retention.
     ///
-    /// Once the stream has been fully purged from memory, any additional frames
-    /// received for that stream will result in a connection level protocol
-    /// error, forcing the connection to terminate.
+    /// Frames for streams no longer retained follow the closed-stream rules for
+    /// their frame type. For example, late DATA causes a stream-local
+    /// `STREAM_CLOSED` reset, while WINDOW_UPDATE on a closed stream is ignored.
     ///
     /// The default value is currently 50.
     pub fn max_concurrent_reset_streams(mut self, max: usize) -> Self {
@@ -230,9 +236,10 @@ where
     /// this state will be maintained in memory. Once the duration elapses, the
     /// stream state is purged from memory.
     ///
-    /// Once the stream has been fully purged from memory, any additional frames
-    /// received for that stream will result in a connection level protocol
-    /// error, forcing the connection to terminate.
+    /// After expiration, frames follow the closed-stream rules for their frame
+    /// type rather than being silently discarded during reset retention. Late
+    /// DATA causes a stream-local `STREAM_CLOSED` reset; it does not by itself
+    /// terminate the connection.
     ///
     /// The default value is currently 1 second.
     pub fn reset_stream_duration(mut self, dur: Duration) -> Self {
@@ -292,14 +299,6 @@ where
         self
     }
 
-    // TODO
-    // Sets the first stream ID to something other than 1.
-    //pub fn initial_stream_id(&mut self, stream_id: u32) -> &mut Self {
-    //    self.stream_id = stream_id.into();
-    //    assert!(self.stream_id.is_client_initiated(), "stream id must be odd");
-    //    self
-    //}
-
     pub fn max_recv_buffer_size(mut self, size: usize) -> Self {
         self.max_recv_buffer_size = size;
         self
@@ -338,6 +337,8 @@ where
         peer_settings: frame::Settings,
     ) -> ConnectionConfig {
         ConnectionConfig {
+            #[cfg(feature = "test-util")]
+            initial_stream_id: self.initial_stream_id,
             initial_connection_window_size: self
                 .initial_connection_window_size,
             local_max_error_reset_streams: self.local_max_error_reset_streams,

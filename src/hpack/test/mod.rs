@@ -1,3 +1,2 @@
-// TODO: uncomment
-// mod fixture;
+mod fixture;
 mod fuzz;

@@ -40,7 +40,14 @@ impl Actions {
         send.next_stream_id = Ok(if role.is_server() {
             2.into()
         } else {
-            1.into()
+            #[cfg(feature = "test-util")]
+            {
+                config.initial_stream_id
+            }
+            #[cfg(not(feature = "test-util"))]
+            {
+                1.into()
+            }
         });
         Actions {
             recv: Recv::new(&config, &role),

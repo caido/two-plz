@@ -6,7 +6,7 @@ async fn single_stream_send_large_body() {
     let payload = vec![0; 1024];
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         .write(&[
             // POST /
             0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75,
@@ -148,7 +148,7 @@ async fn single_stream_send_extra_large_body_multi_frames_one_buffer() {
     let payload = vec![0; 32_768];
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         .write(&[
             // POST /
             0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75,
@@ -189,7 +189,7 @@ async fn single_stream_send_body_greater_than_default_window() {
     let payload = vec![0u8; 16384 * 5 - 1]; // 81,919 bytes
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         .write(&[
             // POST /
             0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75,
@@ -250,7 +250,7 @@ async fn single_stream_send_extra_large_body_multi_frames_multi_buffer() {
     let payload = vec![0u8; 32_768];
 
     let mock = mock_io::Builder::new()
-        .handshake()
+        .client_handshake()
         .wait(Duration::from_millis(10))
         .write(&[
             // POST /

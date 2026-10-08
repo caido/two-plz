@@ -23,6 +23,10 @@ pub struct SpaTracker {
     // pending streams with stream level window update
     pending_stream_window_update: Option<Vec<StreamId>>,
     pub(crate) mode: Mode,
+    // DATA is handed to the codec once; transport flushing may take many polls.
+    frames_handed_off: bool,
+    // Reserved final bytes are refundable only until DATA reaches the codec.
+    pub(crate) reserved_streams: Vec<StreamId>,
 }
 
 impl From<Mode> for SpaTracker {
@@ -31,6 +35,8 @@ impl From<Mode> for SpaTracker {
             pending_spa: Vec::new(),
             pending_stream_window_update: None,
             mode,
+            frames_handed_off: false,
+            reserved_streams: Vec::new(),
         }
     }
 }
@@ -60,6 +66,18 @@ impl SpaTracker {
                 q.retain(|x| *x != stream);
                 (!q.is_empty()).then_some(q)
             });
+    }
+
+    /// Removes unsent work for a cancelled stream without restarting synchronization
+    /// or discarding bytes already handed to the codec.
+    pub(crate) fn remove_stream(&mut self, stream: StreamId) -> bool {
+        self.pending_spa
+            .retain(|id| *id != stream);
+        self.remove_pending_stream_update(stream);
+        let reserved = self.reserved_streams.contains(&stream);
+        self.reserved_streams
+            .retain(|id| *id != stream);
+        reserved
     }
 
     pub(crate) fn add_enhanced_ping_first_ping(
@@ -115,13 +133,18 @@ impl SpaTracker {
     where
         T: AsyncWrite + Unpin,
     {
-        if !dst.write_buf_empty() {
-            ready!(dst.flush(cx))?;
+        if !self.frames_handed_off {
+            if !dst.write_buf_empty() {
+                ready!(dst.flush(cx))?;
+            }
+            let size = self.pending_spa.len() * 10;
+            dst.inc_write_buffer(size);
+            self.pending_spa.sort();
+            self.fill_frames(store, buffer, dst)?;
+            self.pending_spa.clear();
+            self.reserved_streams.clear();
+            self.frames_handed_off = true;
         }
-        let size = self.pending_spa.len() * 10;
-        dst.inc_write_buffer(size);
-        self.pending_spa.sort();
-        self.fill_frames(store, buffer, dst);
         dst.flush(cx)
     }
 
@@ -130,7 +153,8 @@ impl SpaTracker {
         store: &mut Store,
         buffer: &mut Buffer<Frame<Bytes>>,
         dst: &mut Codec<T, Bytes>,
-    ) where
+    ) -> io::Result<()>
+    where
         T: AsyncWrite + Unpin,
     {
         tracing::trace!("filling frames");
@@ -146,8 +170,11 @@ impl SpaTracker {
             } else {
                 error!("not a data frame| {:?}", frame.kind())
             }
-            let _ = dst.buffer(frame);
+            dst.buffer(frame).map_err(|error| {
+                io::Error::new(io::ErrorKind::InvalidData, error)
+            })?;
         }
+        Ok(())
     }
 
     pub fn poll<T>(
@@ -194,6 +221,51 @@ impl SpaTracker {
             }
             Mode::Ping(Some((_, false))) | Mode::EnhancedPing(..) => {
                 Poll::Pending
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_preserves_stages_and_other_waits() {
+        for mode in [
+            Mode::Native,
+            Mode::Ping(None),
+            Mode::Ping(Some(([1; 8], false))),
+            Mode::Ping(Some(([1; 8], true))),
+            Mode::EnhancedPing(PingState::Init, None),
+            Mode::EnhancedPing(PingState::FirstSent, Some([1; 8])),
+            Mode::EnhancedPing(PingState::SecondToSend, None),
+            Mode::EnhancedPing(PingState::SecondSent, Some([1; 8])),
+            Mode::EnhancedPing(PingState::Fin, None),
+        ] {
+            for handed_off in [false, true] {
+                let mut tracker = SpaTracker::from(mode.clone());
+                tracker.frames_handed_off = handed_off;
+                let first = StreamId::from(1);
+                let second = StreamId::from(3);
+                tracker.pending_spa = vec![first, second, first];
+                tracker.add_pending_stream_update(first);
+                tracker.add_pending_stream_update(second);
+                tracker.add_pending_stream_update(first);
+                for _ in 0..3 {
+                    tracker.remove_stream(first);
+                }
+                assert_eq!(tracker.pending_spa, vec![second]);
+                assert_eq!(
+                    tracker.pending_stream_window_update,
+                    Some(vec![second])
+                );
+                tracker.remove_stream(second);
+                tracker.remove_stream(second);
+                assert!(tracker.pending_spa.is_empty());
+                assert_eq!(tracker.pending_stream_window_update, None);
+                assert_eq!(tracker.mode, mode);
+                assert_eq!(tracker.frames_handed_off, handed_off);
             }
         }
     }
