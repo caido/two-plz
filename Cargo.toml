@@ -7,24 +7,21 @@ license = "MIT"
 [workspace]
 members = ["tests/two-tests", "tests/support"]
 
-# Use one header type across direct and transitive dependencies.
-[patch.crates-io]
-header-plz = { git = "ssh://git@github.com/caido/primitives.git", rev = "67d43e6e912272e12561db5bfa40f6067bb9bd78" }
-
 [dependencies]
 bytes = "1.11.0"
 fnv = "1.0.7"
 futures = { version = "0.3.31", default-features = false, features = ["std"] }
 futures-core = { version = "0.3.31", default-features = false }
 futures-sink = { version = "0.3.31", default-features = false }
-header-plz = { git = "ssh://git@github.com/caido/primitives.git", rev = "67d43e6e912272e12561db5bfa40f6067bb9bd78" }
+# Match the primitives revision pinned by http-plz to share public header types.
+header-plz = { git = "ssh://git@github.com/caido/primitives.git", rev = "b24d61a8602d3dc19881641dd527ee727b6908ac" }
 indexmap = { version = "2.2.6", features = ["std"] }
 slab = "0.4.11"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["io-util"] }
 tokio-util = { version = "0.7.17", features = ["codec", "io"] }
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
-http-plz = "0.0.12"
+http-plz = { git = "ssh://git@github.com/caido/http-plz.git", rev = "4bb74a150b5d17f9a05ed6550e25257411bd15ba" }
 
 [dev-dependencies]
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }

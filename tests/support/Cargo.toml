@@ -8,8 +8,8 @@ publish = false
 atty = "0.2"
 bytes = "1.11.1"
 futures = { version = "0.3", default-features = false }
-header-plz = "0.0.50"
-http-plz = "0.0.12"
+header-plz = { git = "ssh://git@github.com/caido/primitives.git", rev = "b24d61a8602d3dc19881641dd527ee727b6908ac" }
+http-plz = { git = "ssh://git@github.com/caido/http-plz.git", rev = "4bb74a150b5d17f9a05ed6550e25257411bd15ba" }
 tokio = { version = "1", features = ["time"] }
 tokio-test = "0.4"
 tracing = "0.1"
