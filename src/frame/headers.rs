@@ -89,7 +89,7 @@ pub struct Iter {
     fields: std::vec::IntoIter<Header>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Eq)]
 struct HeaderBlock {
     /// The decoded header fields
     fields: HeaderMap,
@@ -100,9 +100,23 @@ struct HeaderBlock {
     /// Set to true if decoding went over the max header list size.
     is_over_size: bool,
 
+    /// Validation state retained across header block fragments.
+    regular_field_seen: bool,
+    malformed: bool,
+
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
+}
+
+impl PartialEq for HeaderBlock {
+    fn eq(&self, other: &Self) -> bool {
+        // Decoder progress is not part of the frame's semantic contents.
+        self.fields == other.fields
+            && self.field_size == other.field_size
+            && self.is_over_size == other.is_over_size
+            && self.pseudo == other.pseudo
+    }
 }
 
 #[derive(Debug)]
@@ -132,6 +146,8 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                regular_field_seen: false,
+                malformed: false,
                 pseudo,
             },
             flags: HeadersFlag::default(),
@@ -149,6 +165,8 @@ impl Headers {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                regular_field_seen: false,
+                malformed: false,
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -217,6 +235,8 @@ impl Headers {
                 fields: HeaderMap::new(),
                 field_size: 0,
                 is_over_size: false,
+                regular_field_seen: false,
+                malformed: false,
                 pseudo: Pseudo::default(),
             },
             flags,
@@ -344,23 +364,35 @@ impl fmt::Debug for Headers {
 pub struct ParseU64Error;
 
 pub fn parse_u64(src: &[u8]) -> Result<u64, ParseU64Error> {
-    if src.len() > 19 {
-        // At danger for overflow...
+    if src.is_empty() {
         return Err(ParseU64Error);
     }
 
-    let mut ret = 0;
+    let mut ret = 0u64;
 
     for &d in src {
         if !d.is_ascii_digit() {
             return Err(ParseU64Error);
         }
 
-        ret *= 10;
-        ret += (d - b'0') as u64;
+        ret = ret
+            .checked_mul(10)
+            .and_then(|value| value.checked_add((d - b'0') as u64))
+            .ok_or(ParseU64Error)?;
     }
 
     Ok(ret)
+}
+
+#[cfg(test)]
+#[test]
+fn content_length_integer_boundaries() {
+    assert_eq!(parse_u64(b"0"), Ok(0));
+    assert_eq!(parse_u64(b"00000000000000000000001"), Ok(1));
+    assert_eq!(parse_u64(b"18446744073709551615"), Ok(u64::MAX));
+    for invalid in [b"".as_slice(), b"18446744073709551616", b"-1", b"1x"] {
+        assert_eq!(parse_u64(invalid), Err(ParseU64Error));
+    }
 }
 
 // ===== impl PushPromise =====
@@ -384,6 +416,8 @@ impl PushPromise {
                 field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
+                regular_field_seen: false,
+                malformed: false,
                 pseudo,
             },
             promised_id,
@@ -483,6 +517,8 @@ impl PushPromise {
                 fields: HeaderMap::new(),
                 field_size: 0,
                 is_over_size: false,
+                regular_field_seen: false,
+                malformed: false,
                 pseudo: Pseudo::default(),
             },
             promised_id,
@@ -903,8 +939,8 @@ impl HeaderBlock {
         max_header_list_size: usize,
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
-        let mut reg = !self.fields.is_empty();
-        let mut malformed = false;
+        let mut reg = self.regular_field_seen;
+        let mut malformed = self.malformed;
         let mut headers_size = self.calculate_header_list_size();
 
         macro_rules! set_pseudo {
@@ -938,8 +974,17 @@ impl HeaderBlock {
         let res = decoder.decode(&mut cursor, |header| {
             use crate::hpack::Header::*;
 
+            if !header.is_valid_field() {
+                malformed = true;
+                reg = true;
+                return;
+            }
+
             match header {
                 Field { name, value } => {
+                    // Every regular field ends the pseudoheader section, even
+                    // when the field itself makes the message malformed.
+                    reg = true;
                     // Connection level header fields are not supported and must
                     // result in a protocol error.
 
@@ -979,6 +1024,10 @@ impl HeaderBlock {
                 Status(v) => set_pseudo!(status, v),
             }
         });
+
+        // Decoding may need another fragment after already validating fields.
+        self.regular_field_seen = reg;
+        self.malformed = malformed;
 
         if let Err(e) = res {
             tracing::trace!("hpack decoding error; err={:?}", e);

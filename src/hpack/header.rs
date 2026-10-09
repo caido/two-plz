@@ -113,11 +113,8 @@ impl Header {
                 _ => Err(DecoderError::InvalidPseudoheader),
             }
         } else {
-            // HTTP/2 requires lower case header names
-            //let name = HeaderName::from_lowercase(&name)?;
-            //let value = HeaderValue::from_bytes(&value)?;
-
-            // TODO: lower case
+            // Keep the wire bytes for HPACK table synchronization. Field
+            // syntax is validated when assembling the decoded message.
             let name = BytesStr(name);
             let value = BytesStr(value);
 
@@ -125,6 +122,29 @@ impl Header {
                 name,
                 value,
             })
+        }
+    }
+
+    /// Validate regular field syntax after decoding, so malformed messages do
+    /// not interrupt updates to the connection's HPACK table.
+    pub(crate) fn is_valid_field(&self) -> bool {
+        match self {
+            Header::Field {
+                name,
+                value,
+            } => !name.is_empty() && name.as_ref().iter().all(|b| {
+                matches!(
+                    b,
+                    b'a'..=b'z' | b'0'..=b'9' | b'!' | b'#' | b'$' | b'%' |
+                    b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' |
+                    b'`' | b'|' | b'~'
+                )
+            })
+                && !value
+                    .as_ref()
+                    .iter()
+                    .any(|b| matches!(b, 0 | b'\r' | b'\n')),
+            _ => true,
         }
     }
 

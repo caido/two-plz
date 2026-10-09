@@ -47,6 +47,61 @@ impl OpaqueStreamRef {
             .poll_response(cx, &mut stream)
     }
 
+    pub fn poll_streaming_response(
+        &mut self,
+        cx: &Context,
+    ) -> Poll<Result<Response, crate::error::OpError>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.key);
+        me.actions
+            .recv
+            .poll_streaming_response(cx, &mut stream)
+    }
+
+    pub fn poll_body(
+        &mut self,
+        cx: &Context,
+    ) -> Poll<Option<Result<crate::message::BodyFrame, crate::error::OpError>>>
+    {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.key);
+        let result = me
+            .actions
+            .recv
+            .poll_body(cx, &mut stream);
+        if result.is_ready()
+            && let Some(task) = me.actions.task.take()
+        {
+            task.wake();
+        }
+        result
+    }
+
+    pub fn abandon_body(&mut self) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let stream = me.store.resolve(self.key);
+        me.counts
+            .transition(stream, |counts, stream| {
+                me.actions
+                    .recv
+                    .discard_streaming_body(stream);
+                if !stream.state.is_recv_end_stream() {
+                    me.actions.send.schedule_implicit_reset(
+                        stream,
+                        Reason::CANCEL,
+                        counts,
+                        &mut me.actions.task,
+                    );
+                }
+            });
+        if let Some(task) = me.actions.task.take() {
+            task.wake();
+        }
+    }
+
     pub fn take_partial_response(&mut self) -> Option<Response> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
@@ -107,7 +162,7 @@ impl Drop for OpaqueStreamRef {
         }
 
         // release capacity
-        if stream.connection_window_allocated > 0 {
+        if stream.ref_count == 0 && stream.connection_window_allocated > 0 {
             let _ = actions
                 .send
                 .recv_connection_window_update(
@@ -116,10 +171,18 @@ impl Drop for OpaqueStreamRef {
                     &mut me.counts,
                 );
         }
-        // clear received buffer
-        actions
-            .recv
-            .clear_stream_queue(&mut stream);
+        // Other handles may still be consuming the receive queue.
+        if stream.ref_count == 0 {
+            if stream.streaming_recv {
+                actions
+                    .recv
+                    .discard_streaming_body(&mut stream);
+            } else {
+                actions
+                    .recv
+                    .clear_stream_queue(&mut stream);
+            }
+        }
 
         me.counts
             .transition(stream, |counts, stream| {

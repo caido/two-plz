@@ -1470,7 +1470,6 @@ async fn allow_empty_data_for_head() {
     join(srv_fut, client_fut).await;
 }
 
-// TODO: partial response if content length mismatch ?
 #[tokio::test]
 async fn reject_non_zero_content_length_header_with_end_stream() {
     support::trace_init!();
@@ -1506,14 +1505,77 @@ async fn reject_non_zero_content_length_header_with_end_stream() {
         let req = build_test_request();
         let resp_fut = client.send_request(req).unwrap();
 
-        // Should error due to Content-Length mismatch
-        let _ = conn.drive(resp_fut).await.unwrap_err();
-        // Verify it's a protocol error related to content length
+        let (response, err) = conn
+            .drive(resp_fut)
+            .await
+            .unwrap_err()
+            .into_parts();
+        assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+        let response = response.expect("valid response headers are retained");
+        assert_eq!(response.status(), &StatusCode::OK);
+        assert!(response.body_as_ref().is_none());
 
         conn.await.expect("connection");
     };
 
     join(srv_fut, client_fut).await;
+}
+
+#[tokio::test]
+async fn content_length_mismatch_retains_partial_body() {
+    support::trace_init!();
+    // Short final DATA, an excessive DATA frame, and an untrusted large length.
+    for (length, final_data, expected_body) in [
+        ("5", "cd", "abcd"),
+        ("3", "cd", "ab"),
+        ("18446744073709551615", "cd", "abcd"),
+    ] {
+        let (io, mut srv) = mock::new();
+        let srv_fut = async move {
+            srv.assert_client_handshake().await;
+            srv.recv_frame(
+                frames::headers(1)
+                    .request("GET", "https", "http2.akamai.com", "/")
+                    .eos(),
+            )
+            .await;
+            srv.send_frame(
+                frames::headers(1)
+                    .response(200)
+                    .field("content-length", length),
+            )
+            .await;
+            srv.send_frame(frames::data(1, "ab"))
+                .await;
+            srv.send_frame(frames::data(1, final_data).eos())
+                .await;
+            srv.recv_frame(frames::reset(1).reason(Reason::PROTOCOL_ERROR))
+                .await;
+        };
+        let client_fut = async move {
+            let (mut conn, mut client) = ClientBuilder::new()
+                .handshake(io)
+                .await
+                .unwrap();
+            let response = client
+                .send_request(build_test_request())
+                .unwrap();
+            let (partial, err) = conn
+                .drive(response)
+                .await
+                .unwrap_err()
+                .into_parts();
+            assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+            let partial = partial.expect("response headers");
+            assert_eq!(partial.status(), &StatusCode::OK);
+            assert_eq!(
+                partial.body_as_ref().unwrap().as_ref(),
+                expected_body.as_bytes()
+            );
+            conn.await.expect("connection");
+        };
+        join(srv_fut, client_fut).await;
+    }
 }
 
 #[tokio::test]
@@ -1764,6 +1826,20 @@ async fn extended_connect_request() {
             .await
             .expect("handshake");
 
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| {
+                let result = Pin::new(&mut conn).poll(cx);
+                assert!(result.is_pending());
+                if conn.is_extended_connect_protocol_enabled() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("peer did not enable extended CONNECT");
         let uri = Uri::builder()
             .authority("bread")
             .scheme(Scheme::HTTP)

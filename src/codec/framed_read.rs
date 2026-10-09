@@ -188,6 +188,9 @@ fn decode_frame(
             match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
                 Ok(_) => {},
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
+                // Consume the whole block before resetting so the connection's
+                // HPACK table includes entries in later fragments.
+                Err(frame::Error::MalformedMessage) if !is_end_headers => {},
                 Err(frame::Error::MalformedMessage) => {
                     let id = $head.stream_id();
                     proto_err!(stream: "malformed header block; stream={:?}", id);
@@ -295,6 +298,13 @@ fn decode_frame(
                         Reason::PROTOCOL_ERROR,
                     ));
                 }
+                Err(frame::Error::InvalidPayloadLength) => {
+                    // RFC 7540 section 6.3 specifies a stream error here.
+                    return Err(ProtoError::library_reset(
+                        head.stream_id(),
+                        Reason::FRAME_SIZE_ERROR,
+                    ));
+                }
                 Err(e) => {
                     proto_err!(conn: "failed to load PRIORITY frame; err={:?};", e);
                     return Err(ProtoError::library_go_away(
@@ -381,6 +391,7 @@ fn decode_frame(
                 Ok(_) => {}
                 Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_)))
                     if !is_end_headers => {}
+                Err(frame::Error::MalformedMessage) if !is_end_headers => {}
                 Err(frame::Error::MalformedMessage) => {
                     let id = head.stream_id();
                     proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);

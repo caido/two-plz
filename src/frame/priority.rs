@@ -21,6 +21,18 @@ pub struct StreamDependency {
 }
 
 impl Priority {
+    pub fn encode<B: bytes::BufMut>(&self, dst: &mut B) {
+        Head::new(Kind::Priority, 0, self.stream_id).encode(5, dst);
+        let dependency_id: u32 = self.dependency.dependency_id.into();
+        let exclusive = if self.dependency.is_exclusive {
+            1 << 31
+        } else {
+            0
+        };
+        dst.put_u32(dependency_id | exclusive);
+        dst.put_u8(self.dependency.weight);
+    }
+
     pub fn load(head: Head, payload: &[u8]) -> Result<Self, Error> {
         let dependency = StreamDependency::load(payload)?;
 

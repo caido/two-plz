@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use http_plz::Request;
+use http_plz::{Message, Request};
 use tokio::io::AsyncWrite;
 use tracing::trace;
 
@@ -86,6 +86,21 @@ impl Streams<Bytes> {
             return Err(UserError::UnexpectedFrameType.into());
         }
 
+        let mut request = request;
+        let body = request.take_body();
+        let trailers = request.take_trailers();
+        let (head, headers) = request.into_message_head();
+        crate::message::validate_extended_connect_request(&head)?;
+        if head.extension().is_some()
+            && !me
+                .actions
+                .send
+                .is_extended_connect_protocol_enabled()
+        {
+            return Err(UserError::Rejected.into());
+        }
+        let request = Message::new(head, headers, body, trailers);
+
         let stream_id = me.actions.send.open()?;
 
         let mut stream = Stream::new(
@@ -94,6 +109,7 @@ impl Streams<Bytes> {
             me.actions.recv.init_window_sz(),
         );
 
+        stream.is_connect = *request.method() == Method::CONNECT;
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
         }
@@ -137,6 +153,97 @@ impl Streams<Bytes> {
         me.refs += 1;
 
         Ok(OpaqueStreamRef::new(self.inner.clone(), &mut stream))
+    }
+
+    pub fn send_request_streaming(
+        &mut self,
+        request: Request,
+        end_stream: bool,
+        is_spa: bool,
+    ) -> Result<StreamRef, SendError> {
+        use super::stream::ContentLength;
+        use header_plz::Method;
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.ensure_no_conn_error()?;
+        me.actions
+            .send
+            .ensure_streaming_supported()?;
+        me.actions
+            .send
+            .ensure_next_stream_id()?;
+        if me.counts.role().is_server() {
+            return Err(UserError::UnexpectedFrameType.into());
+        }
+        if is_spa {
+            return Err(UserError::Rejected.into());
+        }
+        let mut request = request;
+        let body = request.take_body();
+        let trailers = request.take_trailers();
+        let (head, headers) = request.into_message_head();
+        crate::message::validate_extended_connect_request(&head)?;
+        if head.extension().is_some()
+            && !me
+                .actions
+                .send
+                .is_extended_connect_protocol_enabled()
+        {
+            return Err(UserError::Rejected.into());
+        }
+        let is_head = *head.method() == Method::HEAD;
+        let is_connect = *head.method() == Method::CONNECT;
+        // Validate the streaming head before allocating a stream ID.
+        if body.is_some() || trailers.is_some() {
+            return Err(UserError::UnexpectedFrameType.into());
+        }
+        let request = Message::new(head, headers, body, trailers);
+        let id = me.actions.send.open()?;
+        let mut frames = TwoTwoFrame::from((id, request));
+        if !end_stream {
+            frames.header.unset_end_stream();
+        }
+        let mut stream = Stream::new(
+            id,
+            me.actions.send.init_window_sz(),
+            me.actions.recv.init_window_sz(),
+        );
+        stream.streaming_recv = true;
+        stream.is_connect = is_connect;
+        if is_head {
+            stream.content_length = ContentLength::Head;
+        }
+        let mut stream = me.store.insert(id, stream);
+        let mut buffer = self.send_buffer.inner.lock().unwrap();
+        if let Err(error) = me.actions.send.send_headers(
+            frames.header,
+            &mut buffer,
+            &mut stream,
+            &mut me.counts,
+            &mut me.actions.task,
+        ) {
+            stream.unlink();
+            stream.remove();
+            return Err(error.into());
+        }
+        if !end_stream {
+            me.actions.send.start_streaming(id);
+        }
+        me.refs += 1;
+        Ok(StreamRef::new(
+            self.inner.clone(),
+            &mut stream,
+            self.send_buffer.clone(),
+        ))
+    }
+
+    pub fn set_streaming_accept(&mut self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .actions
+            .recv
+            .streaming = true;
     }
 
     // ===== Recv =====

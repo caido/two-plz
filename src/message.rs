@@ -11,6 +11,152 @@ use header_plz::{
 };
 use http_plz::{Message, Request, Response};
 
+/// Validate an outbound extended CONNECT before allocating a stream ID.
+/// Every request extension is a :protocol value in this API.
+pub(crate) fn validate_extended_connect_request(
+    head: &RequestLine,
+) -> Result<(), crate::codec::UserError> {
+    let Some(extension) = head.extension() else {
+        return Ok(());
+    };
+    let protocol = Protocol::try_from(extension.clone())
+        .map_err(|_| crate::codec::UserError::MalformedHeaders)?;
+    let uri = head.uri();
+    if !protocol.is_valid()
+        || head.method() != &Method::CONNECT
+        || uri
+            .scheme()
+            .is_none_or(|scheme| scheme.as_str().is_empty())
+        || uri.path().is_empty()
+        || uri
+            .authority()
+            .is_none_or(str::is_empty)
+    {
+        return Err(crate::codec::UserError::MalformedHeaders);
+    }
+    Ok(())
+}
+
+/// A received body chunk or the trailers that terminate a body.
+#[derive(Debug)]
+pub enum BodyFrame {
+    Data(bytes::Bytes),
+    Trailers(HeaderMap),
+}
+
+/// An incremental receive body. Keep driving the connection while reading it.
+/// Flow-control capacity is returned when a frame is yielded, so callers should
+/// process each chunk before requesting the next rather than accumulate chunks.
+#[derive(Debug)]
+pub struct RecvBody {
+    pub(crate) inner: crate::proto::streams::OpaqueStreamRef,
+    pub(crate) done: bool,
+}
+
+impl RecvBody {
+    pub fn stream_id(&self) -> StreamId {
+        self.inner.stream_id()
+    }
+
+    pub async fn frame(
+        &mut self,
+    ) -> Option<Result<BodyFrame, crate::error::OpError>> {
+        futures::future::poll_fn(|cx| self.poll_frame(cx)).await
+    }
+
+    pub fn poll_frame(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<BodyFrame, crate::error::OpError>>>
+    {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let result = self.inner.poll_body(cx);
+        if matches!(result, std::task::Poll::Ready(None | Some(Err(_)))) {
+            self.done = true;
+        }
+        result
+    }
+}
+
+impl Drop for RecvBody {
+    fn drop(&mut self) {
+        if !self.done {
+            self.inner.abandon_body();
+        }
+    }
+}
+
+#[cfg(feature = "stream")]
+impl futures_core::Stream for RecvBody {
+    type Item = Result<BodyFrame, crate::error::OpError>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.poll_frame(cx)
+    }
+}
+
+/// An incremental send body. Writes wait for bounded queue capacity. Keep
+/// driving the connection while writing; completion means queued, not flushed.
+#[derive(Debug)]
+pub struct SendBody {
+    pub(crate) inner: crate::proto::streams::StreamRef,
+}
+
+impl SendBody {
+    pub fn stream_id(&self) -> StreamId {
+        self.inner.stream_id()
+    }
+
+    /// Sends a chunk, optionally ending the stream. If canceled while pending,
+    /// a prefix may already have been queued; use `poll_send_data` to retain the
+    /// remaining bytes across cancellation.
+    pub async fn send_data(
+        &mut self,
+        mut data: bytes::Bytes,
+        end_stream: bool,
+    ) -> Result<(), crate::error::OpError> {
+        futures::future::poll_fn(|cx| {
+            self.poll_send_data(cx, &mut data, end_stream)
+        })
+        .await
+    }
+
+    /// On Pending, `data` contains only the bytes not yet queued.
+    pub fn poll_send_data(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        data: &mut bytes::Bytes,
+        end_stream: bool,
+    ) -> std::task::Poll<Result<(), crate::error::OpError>> {
+        self.inner
+            .poll_send_data(cx, data, end_stream)
+            .map_err(Into::into)
+    }
+
+    pub fn send_trailers(
+        &mut self,
+        trailers: HeaderMap,
+    ) -> Result<(), crate::error::OpError> {
+        self.inner
+            .send_trailers(trailers)
+            .map_err(Into::into)
+    }
+
+    pub fn send_reset(&mut self, reason: Reason) {
+        self.inner.send_reset(reason);
+    }
+}
+
+impl Drop for SendBody {
+    fn drop(&mut self) {
+        self.inner.abandon_send();
+    }
+}
+
 pub trait IntoPseudo {
     fn into_pseudo(self) -> Pseudo;
 }
@@ -126,6 +272,14 @@ pub(crate) fn frames_to_request(
     // add protocol for CONNECT requests
     let has_protocol = pseudo.protocol.is_some();
     if has_protocol {
+        if !pseudo
+            .protocol
+            .as_ref()
+            .unwrap()
+            .is_valid()
+        {
+            malformed!("malformed headers| invalid :protocol token");
+        }
         if is_connect {
             b = b.extension(pseudo.protocol.unwrap().into_bytes());
         } else {
@@ -138,6 +292,14 @@ pub(crate) fn frames_to_request(
 
     // authority
     let mut has_authority = false;
+    if has_protocol
+        && pseudo
+            .authority
+            .as_ref()
+            .is_none_or(|a| a.is_empty())
+    {
+        malformed!("malformed headers| missing authority in extended CONNECT");
+    }
     if let Some(authority) = pseudo.authority {
         has_authority = true;
         uri_b = uri_b.authority(authority);
@@ -145,10 +307,16 @@ pub(crate) fn frames_to_request(
 
     // A :scheme is required, except CONNECT.
     if let Some(scheme) = pseudo.scheme {
+        if scheme.is_empty() {
+            malformed!("malformed headers| empty scheme");
+        }
         if is_connect && !has_protocol {
             malformed!("malformed headers| :scheme in CONNECT");
         }
-        let scheme = Scheme::try_from(scheme.as_str()).unwrap();
+        let scheme = match Scheme::try_from(scheme.as_str()) {
+            Ok(scheme) => scheme,
+            Err(_) => malformed!("malformed headers| invalid scheme"),
+        };
 
         // It's not possible to build an `Uri` from a scheme and path. So,
         // after validating is was a valid scheme, we just have to drop it
@@ -171,11 +339,14 @@ pub(crate) fn frames_to_request(
             malformed!("malformed headers| missing path");
         }
         uri_b = uri_b.path(path.as_str());
-    } else if is_connect && has_protocol {
-        malformed!("malformed headers| missing path in extended CONNECT");
+    } else if !is_connect || has_protocol {
+        malformed!("malformed headers| missing path");
     }
 
-    let uri = uri_b.build().unwrap();
+    let uri = match uri_b.build() {
+        Ok(uri) => uri,
+        Err(_) => malformed!("malformed headers| invalid URI"),
+    };
     b = b.uri(uri);
     b = b.headers(headers);
 

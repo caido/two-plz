@@ -165,7 +165,9 @@ where
         match frame {
             Frame::Data(data) => self.streams.recv_data(data),
             Frame::Headers(headers) => self.streams.recv_header(headers),
-            Frame::Priority(_priority) => todo!(), // hyper
+            // Priority information does not change stream state. Scheduling based
+            // on the deprecated dependency tree is not implemented.
+            Frame::Priority(_) => Ok(()),
             Frame::Reset(reset) => self.streams.recv_reset(reset),
             Frame::Settings(settings) => self.recv_settings(settings),
             Frame::PushPromise(_push_promise) => todo!(), // hyper

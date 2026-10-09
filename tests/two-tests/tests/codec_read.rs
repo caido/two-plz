@@ -1,6 +1,37 @@
 use support::prelude::*;
 
 #[tokio::test]
+async fn read_invalid_priority_error_scope() {
+    use two_plz::proto::ProtoError;
+    for (id, payload, expected, connection_error) in [
+        (0u32, vec![0, 0, 0, 1, 0], Reason::PROTOCOL_ERROR, true),
+        (1, vec![0, 0, 0, 1, 0], Reason::PROTOCOL_ERROR, false),
+        (1, vec![0, 0, 0, 0], Reason::FRAME_SIZE_ERROR, false),
+        (1, vec![0, 0, 0, 0, 0, 0], Reason::FRAME_SIZE_ERROR, false),
+    ] {
+        let mut wire = vec![0, 0, payload.len() as u8, 2, 0];
+        wire.extend_from_slice(&id.to_be_bytes());
+        wire.extend_from_slice(&payload);
+        let mut codec = Codec::from(
+            mock_io::Builder::new()
+                .read(&wire)
+                .build(),
+        );
+        let error = codec.next().await.unwrap().unwrap_err();
+        match error {
+            ProtoError::Reset(stream_id, reason, _) if !connection_error => {
+                assert_eq!(stream_id, id);
+                assert_eq!(reason, expected);
+            }
+            ProtoError::GoAway(_, reason, _) if connection_error => {
+                assert_eq!(reason, expected)
+            }
+            other => panic!("unexpected error scope: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn read_none() {
     let mut codec = Codec::from(mock_io::Builder::new().build());
 
@@ -244,4 +275,61 @@ async fn read_goaway_with_debug_data() {
     assert_eq!(&**data.debug_data(), b"too_many_pings");
 
     assert_closed!(codec);
+}
+
+#[tokio::test]
+async fn read_malformed_headers_continuation_preserves_hpack_table() {
+    use two_plz::proto::ProtoError;
+
+    // Split the indexed literal at every boundary to cover NeedMore as well
+    // as a complete malformed fragment without END_HEADERS.
+    let indexed = [0x40, 1, b'x', 1, b'y'];
+    for split in 0..=indexed.len() {
+        let mut first = vec![
+            0x82, 0x87, 0x84, // :method GET, :scheme https, :path /
+            0, 1, b'X', 1, b'v', // Uppercase name, without indexing
+        ];
+        first.extend_from_slice(&indexed[..split]);
+        let mut wire = vec![0, 0, first.len() as u8, 1, 1, 0, 0, 0, 1];
+        wire.extend_from_slice(&first);
+        // A non-final continuation must also retain the malformed state.
+        wire.extend_from_slice(&[0, 0, 0, 9, 0, 0, 0, 0, 1]);
+        wire.extend_from_slice(&[
+            0,
+            0,
+            (indexed.len() - split) as u8,
+            9,
+            4,
+            0,
+            0,
+            0,
+            1,
+        ]);
+        wire.extend_from_slice(&indexed[split..]);
+        wire.extend_from_slice(&[
+            0, 0, 4, 1, 5, 0, 0, 0, 3, 0x82, 0x87, 0x84,
+            0xbe, // Index 62: x=y from the rejected block
+        ]);
+
+        let mut codec = Codec::from(
+            mock_io::Builder::new()
+                .read(&wire)
+                .build(),
+        );
+        match codec.next().await.unwrap().unwrap_err() {
+            ProtoError::Reset(id, reason, _) => {
+                assert_eq!(id, 1);
+                assert_eq!(reason, Reason::PROTOCOL_ERROR);
+            }
+            other => panic!("unexpected error at split {split}: {other:?}"),
+        }
+        let headers = poll_frame!(Headers, codec);
+        assert_eq!(headers.stream_id(), 3);
+        let (pseudo, fields) = headers.into_parts();
+        assert_eq!(pseudo.method, Some(Method::GET));
+        let mut expected = HeaderMap::new();
+        expected.insert("x", "y");
+        assert_eq!(fields, expected);
+        assert_closed!(codec);
+    }
 }

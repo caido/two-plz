@@ -27,6 +27,33 @@ impl Protocol {
         self.value.as_str()
     }
 
+    /// RFC 8441 section 4 requires a single HTTP Upgrade protocol token.
+    /// Registry membership and application-specific policies are not checked.
+    pub(crate) fn is_valid(&self) -> bool {
+        let value = self.as_ref();
+        !value.is_empty()
+            && value.iter().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+    }
+
     pub(crate) fn try_from(bytes: Bytes) -> Result<Self, std::str::Utf8Error> {
         Ok(Self {
             value: BytesStr::try_from(bytes)?,

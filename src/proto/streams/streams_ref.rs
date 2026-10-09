@@ -100,6 +100,123 @@ impl StreamRef {
         Ok(())
     }
 
+    pub fn send_response_streaming(
+        &mut self,
+        response: Response,
+        end_stream: bool,
+    ) -> Result<(), crate::codec::SendError> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.ensure_no_conn_error()?;
+        me.actions
+            .send
+            .ensure_streaming_supported()?;
+        let stream = me.store.resolve(self.opaque.key);
+        let mut frames = TwoTwoFrame::from((stream.id, response));
+        if frames.take_data().is_some() || frames.take_trailer().is_some() {
+            return Err(UserError::UnexpectedFrameType.into());
+        }
+        if !end_stream {
+            frames.header.unset_end_stream();
+        }
+        let mut buffer = self.send_buffer.inner.lock().unwrap();
+        me.counts
+            .transition(stream, |counts, stream| {
+                me.actions.send.send_headers(
+                    frames.header,
+                    &mut buffer,
+                    stream,
+                    counts,
+                    &mut me.actions.task,
+                )?;
+                if !end_stream {
+                    me.actions
+                        .send
+                        .start_streaming(stream.id);
+                }
+                Ok::<_, UserError>(())
+            })?;
+        Ok(())
+    }
+
+    /// Advances `data` as bounded chunks are queued. Pending callers must retain
+    /// the remaining bytes and poll again with the same END_STREAM value.
+    pub fn poll_send_data(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        data: &mut Bytes,
+        end_stream: bool,
+    ) -> std::task::Poll<Result<(), crate::codec::SendError>> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.ensure_no_conn_error()?;
+        let mut stream = me.store.resolve(self.opaque.key);
+        let mut buffer = self.send_buffer.inner.lock().unwrap();
+        me.actions
+            .send
+            .poll_send_data(
+                cx,
+                data,
+                end_stream,
+                &mut buffer,
+                &mut stream,
+                &mut me.actions.task,
+            )
+            .map(|result| result.map_err(Into::into))
+    }
+
+    /// Wait until this stream's queued DATA has been handed to the codec.
+    pub fn poll_flush(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), crate::codec::SendError>> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.ensure_no_conn_error()?;
+        let stream = me.store.resolve(self.opaque.key);
+        me.actions
+            .send
+            .poll_flush(&stream, cx)
+            .map(|result| result.map_err(Into::into))
+    }
+
+    pub fn send_trailers(
+        &mut self,
+        trailers: header_plz::HeaderMap,
+    ) -> Result<(), crate::codec::SendError> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.ensure_no_conn_error()?;
+        let mut stream = me.store.resolve(self.opaque.key);
+        let mut buffer = self.send_buffer.inner.lock().unwrap();
+        me.actions.send.send_trailers(
+            trailers,
+            &mut buffer,
+            &mut stream,
+            &mut me.actions.task,
+        )?;
+        Ok(())
+    }
+
+    pub fn abandon_send(&mut self) {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.opaque.key);
+        if me
+            .actions
+            .send
+            .is_streaming_send_open(stream.id)
+            && !stream.state.is_send_closed()
+        {
+            me.actions.send.schedule_implicit_reset(
+                &mut stream,
+                Reason::CANCEL,
+                &mut me.counts,
+                &mut me.actions.task,
+            );
+        }
+    }
+
     pub fn send_reset(&mut self, reason: Reason) {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;

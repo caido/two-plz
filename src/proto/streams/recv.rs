@@ -111,6 +111,7 @@ pub struct Recv {
 
     /// Max recv buffer limit
     pub max_recv_buf_limit: usize,
+    pub streaming: bool,
 }
 
 #[derive(Debug)]
@@ -148,6 +149,7 @@ impl Recv {
             check_connection_window_update: false,
             check_stream_window_update: None,
             max_recv_buf_limit: config.max_recv_buffer_size,
+            streaming: false,
         }
     }
 
@@ -169,7 +171,9 @@ impl Recv {
                 stream.id
             ),
         };
-        process_remaining_frames(&mut request, stream, &mut self.buffer);
+        if !stream.streaming_recv {
+            process_remaining_frames(&mut request, stream, &mut self.buffer);
+        }
         request
     }
 
@@ -235,32 +239,16 @@ impl Recv {
 
         let is_eos = frame.is_end_stream();
 
-        // If EOS check if entire body is received and state transition cauess
-        // err
-        if is_eos {
-            if stream
-                .ensure_content_length_zero()
-                .is_err()
-            {
-                return Err(ProtoError::library_reset(
-                    stream.id,
-                    Reason::PROTOCOL_ERROR,
-                ));
-            }
-
-            if stream.state.recv_close().is_err() {
-                return Err(ProtoError::library_go_away(
-                    Reason::PROTOCOL_ERROR,
-                ));
-            }
-        }
-
         // dec stream flow control
         stream
             .recv_flow
             .dec_window(size)
             .map_err(ProtoError::library_go_away)?;
 
+        if stream.streaming_recv {
+            self.flow.hold_capacity(size);
+            stream.recv_flow.hold_capacity(size);
+        }
         // increment current buffer length
         stream.curr_buf_len += size as usize;
 
@@ -280,6 +268,23 @@ impl Recv {
         }
 
         if is_eos {
+            // Retain accepted DATA for a partial response if the body is short.
+            stream
+                .ensure_content_length_zero()
+                .map_err(|()| {
+                    ProtoError::library_reset(
+                        stream.id,
+                        Reason::PROTOCOL_ERROR,
+                    )
+                })?;
+            stream.state.recv_close().map_err(|_| {
+                ProtoError::library_go_away(Reason::PROTOCOL_ERROR)
+            })?;
+        }
+
+        if stream.streaming_recv {
+            stream.notify_recv();
+        } else if is_eos {
             self.move_from_pending_complete(stream, role);
         }
 
@@ -312,8 +317,16 @@ impl Recv {
             counts.inc_num_recv_streams(stream);
         }
 
-        // parse the content length
-        if !stream.content_length.is_head() {
+        // RFC 9110 section 9.3.6 requires clients to ignore content-length on
+        // successful CONNECT responses: subsequent DATA belongs to the tunnel.
+        let successful_connect = stream.is_connect
+            && frame
+                .pseudo()
+                .status
+                .is_some_and(|status| (200..300).contains(&status.as_u16()));
+        if successful_connect {
+            stream.content_length = super::stream::ContentLength::Omitted;
+        } else if !stream.content_length.is_head() {
             Self::parse_content_length(stream, &frame)?;
         }
 
@@ -325,11 +338,21 @@ impl Recv {
 
         let stream_id = frame.stream_id();
         let is_eos = frame.is_end_stream();
+        let allows_content_length_without_body = frame
+            .pseudo()
+            .status
+            .is_some_and(|status| status == 204 || status == 304);
         let (pseudo, fields) = frame.into_parts();
 
         // check extended protocol and response headers in request
         if !self.is_extended_protocol_usage_correct(&pseudo, is_server)
             || Self::are_response_headers_in_request(&pseudo, is_server)
+            || (!is_server
+                && (pseudo.method.is_some()
+                    || pseudo.scheme.is_some()
+                    || pseudo.authority.is_some()
+                    || pseudo.path.is_some()
+                    || pseudo.protocol.is_some()))
         {
             return Err(ProtoError::library_reset(
                 stream.id,
@@ -348,7 +371,28 @@ impl Recv {
                 .pending_recv
                 .push_back(&mut self.buffer, Event::Headers(message));
 
+            // Keep valid headers available when END_STREAM reveals a short body.
+            if is_eos && !allows_content_length_without_body {
+                stream
+                    .ensure_content_length_zero()
+                    .map_err(|()| {
+                        ProtoError::library_reset(
+                            stream.id,
+                            Reason::PROTOCOL_ERROR,
+                        )
+                    })?;
+            }
+
             let role = counts.role();
+            if is_server && self.streaming {
+                stream.streaming_recv = true;
+                self.pending_accept.push(stream);
+                return Ok(());
+            }
+            if stream.streaming_recv {
+                stream.notify_recv();
+                return Ok(());
+            }
             // for server,
             // if EOS is received for stream 3 and pending_complete contains
             // stream 1, we just add stream 3 pending complete to maintain order
@@ -393,22 +437,6 @@ impl Recv {
 
             stream.content_length =
                 ContentLength::Remaining(content_length, content_length);
-            // END_STREAM on headers frame with non-zero content-length is
-            // malformed.
-            // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
-            if frame.is_end_stream()
-                && content_length > 0
-                && frame
-                    .pseudo()
-                    .status
-                    .is_none_or(|status| status != 204 && status != 304)
-            {
-                error!("headers with END_STREAM| content-length is not zero");
-                return Err(ProtoError::library_reset(
-                    stream.id,
-                    Reason::PROTOCOL_ERROR,
-                ));
-            }
         }
         Ok(())
     }
@@ -505,7 +533,11 @@ impl Recv {
         stream
             .pending_recv
             .push_back(&mut self.buffer, Event::Trailers(frame.into_fields()));
-        self.move_from_pending_complete(stream, role);
+        if stream.streaming_recv {
+            stream.notify_recv();
+        } else {
+            self.move_from_pending_complete(stream, role);
+        }
         Ok(())
     }
 
@@ -546,9 +578,7 @@ impl Recv {
         self.move_from_pending_complete(stream, &counts.role());
         stream.notify_recv();
 
-        // TODO(ws)
-        //stream.notify_push();
-        //stream.notify_send();
+        // The caller also clears the send queue, waking any streaming writer.
         Ok(())
     }
 
@@ -634,7 +664,7 @@ impl Recv {
     }
 
     pub fn clear_stream_queue(&mut self, stream: &mut Stream) {
-        if stream.is_pending_complete {
+        if stream.is_pending_complete && !stream.streaming_recv {
             while let Some(frame) = stream
                 .pending_recv
                 .pop_front(&mut self.buffer)
@@ -653,9 +683,7 @@ impl Recv {
         // If a receiver is waiting, notify it
         stream.notify_recv();
 
-        // TODO(ws)
-        //stream.notify_send();
-        //stream.notify_push();
+        // The caller also clears the send queue, waking any streaming writer.
     }
 
     // ====== Window Update =====
@@ -784,9 +812,7 @@ impl Recv {
     pub fn recv_eof(&mut self, stream: &mut Stream) {
         stream.state.recv_eof();
         stream.notify_recv();
-        // TODO(ws)
-        //stream.notify_send();
-        //stream.notify_push();
+        // The caller also clears the send queue, waking any streaming writer.
     }
 
     // ===== Clear =====
@@ -881,6 +907,83 @@ impl Recv {
         Poll::Ready(Ok(()))
     }
 
+    pub fn poll_streaming_response(
+        &mut self,
+        cx: &Context,
+        stream: &mut Ptr,
+    ) -> Poll<Result<Response, OpError>> {
+        stream
+            .state
+            .ensure_recv_open()
+            .map_err(OpError::from)?;
+        if let Some(event) = stream
+            .pending_recv
+            .pop_front(&mut self.buffer)
+        {
+            match event {
+                Event::Headers(PollMessage::Client(response)) => {
+                    return Poll::Ready(Ok(response));
+                }
+                _ => unreachable!("response headers must precede body"),
+            }
+        }
+        stream.recv_task = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    pub fn poll_body(
+        &mut self,
+        cx: &Context,
+        stream: &mut Ptr,
+    ) -> Poll<Option<Result<crate::message::BodyFrame, OpError>>> {
+        if let Err(error) = stream.state.ensure_recv_open() {
+            self.discard_streaming_body(stream);
+            return Poll::Ready(Some(Err(error.into())));
+        }
+        if let Some(event) = stream
+            .pending_recv
+            .pop_front(&mut self.buffer)
+        {
+            let frame = match event {
+                Event::Data(data) => {
+                    let size = data.len() as WindowSize;
+                    stream.curr_buf_len -= data.len();
+                    self.flow.release_capacity(size);
+                    stream.recv_flow.release_capacity(size);
+                    self.check_connection_window_update = true;
+                    crate::message::BodyFrame::Data(data)
+                }
+                Event::Trailers(trailers) => {
+                    crate::message::BodyFrame::Trailers(trailers)
+                }
+                Event::Headers(_) => unreachable!("headers already consumed"),
+            };
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        if stream.state.is_recv_end_stream() {
+            Poll::Ready(None)
+        } else {
+            stream.recv_task = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    pub fn discard_streaming_body(&mut self, stream: &mut Ptr) {
+        while let Some(event) = stream
+            .pending_recv
+            .pop_front(&mut self.buffer)
+        {
+            if let Event::Data(data) = event {
+                self.flow
+                    .release_capacity(data.len() as WindowSize);
+            }
+        }
+        let size = stream.curr_buf_len as WindowSize;
+        stream.recv_flow.release_capacity(size);
+        stream.curr_buf_len = 0;
+        self.check_connection_window_update = true;
+    }
+
     pub fn poll_response(
         &mut self,
         cx: &Context,
@@ -949,14 +1052,9 @@ fn process_remaining_frames<T>(
             }
             Event::Data(data) => {
                 let buf = body.get_or_insert_with(|| {
-                    let capacity = stream
-                        .content_length()
-                        .map(|size| size as usize)
-                        // assume atleast two data frames of same size
-                        // are received
-                        .unwrap_or_else(|| data.len() * 2);
-
-                    BytesMut::with_capacity(capacity)
+                    // Content-Length is untrusted and may greatly exceed the
+                    // bytes received, especially when returning a partial body.
+                    BytesMut::with_capacity(stream.curr_buf_len)
                 });
 
                 buf.reserve(data.len());

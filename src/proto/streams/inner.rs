@@ -594,7 +594,7 @@ impl Inner {
                 .inc_connection_window(size);
         }
 
-        if let Some((stream_id, size)) =
+        while let Some((stream_id, size)) =
             self.should_send_stream_window_update()
         {
             trace!("polling stream window update| {:?}", stream_id);
@@ -631,16 +631,17 @@ impl Inner {
     pub fn should_send_stream_window_update(
         &mut self,
     ) -> Option<(StreamId, WindowSize)> {
-        self.actions
-            .recv
-            .check_stream_window_update
-            .as_ref()
-            .and_then(|key| {
-                self.store[*key]
+        let mut update = None;
+        let _ = self.store.try_for_each(|stream| {
+            if update.is_none() && !stream.state.is_recv_end_stream() {
+                update = stream
                     .recv_flow
                     .should_send_window_update()
-                    .map(|size| (self.store[*key].id, size as WindowSize))
-            })
+                    .map(|size| (stream.id, size));
+            }
+            Ok::<_, ()>(())
+        });
+        update
     }
 
     pub fn poll_complete<T>(

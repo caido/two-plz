@@ -69,8 +69,13 @@ pub struct Send {
 
     is_push_enabled: bool,
     is_extended_connect_protocol_enabled: bool,
+    peer_enabled_connect_protocol: bool,
     /// spa
     spa_tracker: Option<SpaTracker>,
+    /// Streaming send halves and tasks waiting for their bounded DATA queue.
+    streaming: std::collections::HashMap<StreamId, (bool, Option<Waker>)>,
+    /// DATA awaiting a successful codec flush: handoff complete and flush waiter.
+    flush_pending: std::collections::HashMap<StreamId, (bool, Option<Waker>)>,
 }
 
 impl Send {
@@ -95,7 +100,13 @@ impl Send {
                 .peer_settings
                 .is_extended_connect_protocol_enabled()
                 .unwrap_or_default(),
+            peer_enabled_connect_protocol: config
+                .peer_settings
+                .is_extended_connect_protocol_enabled()
+                .unwrap_or_default(),
             spa_tracker: config.spa_tracker.take(),
+            streaming: std::collections::HashMap::new(),
+            flush_pending: std::collections::HashMap::new(),
         }
     }
 
@@ -129,6 +140,139 @@ impl Send {
                 task.wake();
             }
         }
+    }
+
+    pub fn ensure_streaming_supported(&self) -> Result<(), UserError> {
+        if self.spa_tracker.is_some() {
+            return Err(UserError::Rejected);
+        }
+        Ok(())
+    }
+
+    pub fn start_streaming(&mut self, id: StreamId) {
+        self.streaming.insert(id, (false, None));
+    }
+
+    pub fn is_streaming_send_open(&self, id: StreamId) -> bool {
+        matches!(self.streaming.get(&id), Some((false, _)))
+    }
+
+    fn notify_writer(&mut self, id: StreamId) {
+        if let Some((_, task)) = self.flush_pending.get_mut(&id)
+            && let Some(task) = task.take()
+        {
+            task.wake();
+        }
+        if let Some((_, task)) = self.streaming.get_mut(&id)
+            && let Some(task) = task.take()
+        {
+            task.wake();
+        }
+    }
+
+    pub fn poll_send_data(
+        &mut self,
+        cx: &mut Context<'_>,
+        data: &mut Bytes,
+        end_stream: bool,
+        buffer: &mut Buffer<Frame<Bytes>>,
+        stream: &mut Ptr,
+        task: &mut Option<Waker>,
+    ) -> Poll<Result<(), UserError>> {
+        if !stream.state.is_send_streaming()
+            || !matches!(self.streaming.get(&stream.id), Some((false, _)))
+        {
+            return Poll::Ready(Err(UserError::InactiveStreamId));
+        }
+        if stream.remaining_data_len.is_some() {
+            self.streaming
+                .get_mut(&stream.id)
+                .unwrap()
+                .1 = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        if data.is_empty() && !end_stream {
+            return Poll::Ready(Ok(()));
+        }
+        let len = data
+            .len()
+            .min(frame::DEFAULT_MAX_FRAME_SIZE as usize);
+        let mut frame = frame::Data::new(stream.id, data.split_to(len));
+        let final_data = end_stream && data.is_empty();
+        frame.set_end_stream(final_data);
+        self.streaming
+            .get_mut(&stream.id)
+            .unwrap()
+            .0 = final_data;
+        stream.remaining_data_len = Some(len);
+        // A subsequent write invalidates any earlier, not-yet-flushed handoff.
+        self.flush_pending
+            .entry(stream.id)
+            .or_default()
+            .0 = false;
+        self.queue_frame(frame.into(), buffer, stream, task);
+        if data.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            self.streaming
+                .get_mut(&stream.id)
+                .unwrap()
+                .1 = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    /// Wait until this stream's queued DATA has been flushed by the transport.
+    pub fn poll_flush(
+        &mut self,
+        stream: &stream::Stream,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), UserError>> {
+        if stream.state.is_reset() {
+            return Poll::Ready(Err(UserError::InactiveStreamId));
+        }
+        if let Some((_, task)) = self.flush_pending.get_mut(&stream.id) {
+            *task = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        if stream.remaining_data_len.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+        match self.streaming.get_mut(&stream.id) {
+            Some((_, task)) => {
+                *task = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            None => Poll::Ready(Err(UserError::InactiveStreamId)),
+        }
+    }
+
+    pub fn send_trailers(
+        &mut self,
+        fields: HeaderMap,
+        buffer: &mut Buffer<Frame<Bytes>>,
+        stream: &mut Ptr,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        Self::check_headers(&fields)?;
+        if !stream.state.is_send_streaming()
+            || !matches!(self.streaming.get(&stream.id), Some((false, _)))
+        {
+            return Err(UserError::InactiveStreamId);
+        }
+        // Close admission immediately, but leave already queued DATA intact.
+        stream.is_sending_trailer = true;
+        self.streaming
+            .get_mut(&stream.id)
+            .unwrap()
+            .0 = true;
+        self.queue_frame(
+            frame::Headers::trailers(stream.id, fields).into(),
+            buffer,
+            stream,
+            task,
+        );
+        Ok(())
     }
 
     // ===== Headers =====
@@ -242,6 +386,8 @@ impl Send {
             // Stream is already closed, nothing more to do
             return;
         }
+        self.notify_writer(stream.id);
+        self.streaming.remove(&stream.id);
         stream.state.set_scheduled_reset(reason);
         self.reclaim_all_capacity(stream, counts);
         self.schedule_send(stream, task);
@@ -261,7 +407,19 @@ impl Send {
         }
 
         if let Some(val) = settings.is_extended_connect_protocol_enabled() {
-            self.is_extended_connect_protocol_enabled = val;
+            // RFC 8441 forbids disabling the protocol after enabling it.
+            if self.peer_enabled_connect_protocol
+                && settings.disables_connect_protocol()
+            {
+                return Err(ProtoError::library_go_away(
+                    Reason::PROTOCOL_ERROR,
+                ));
+            }
+            self.peer_enabled_connect_protocol = val;
+            // Only a server's advertisement enables client requests.
+            if counts.role().is_client() {
+                self.is_extended_connect_protocol_enabled = val;
+            }
         }
 
         // Applies an update to the remote endpoint's initial window size.
@@ -293,8 +451,7 @@ impl Send {
                     store.try_for_each(|mut stream| {
                         let stream = &mut *stream;
                         if stream.state.is_send_closed()
-                        // TODO(ws)
-                        // && stream.buffered_send_data == 0 {
+                            && stream.remaining_data_len.is_none()
                         {
                             return Ok(());
                         }
@@ -484,7 +641,8 @@ impl Send {
         counts: &mut Counts,
         task: &mut Option<Waker>,
     ) -> Result<(), Reason> {
-        if stream.state.is_send_closed() {
+        if stream.state.is_send_closed() && stream.remaining_data_len.is_none()
+        {
             return Ok(());
         }
 
@@ -567,6 +725,16 @@ impl Send {
 
     /// ===== Clear =====
     pub fn clear_queues(&mut self, store: &mut Store, counts: &mut Counts) {
+        for (_, (_, task)) in self.flush_pending.drain() {
+            if let Some(task) = task {
+                task.wake();
+            }
+        }
+        for (_, (_, task)) in self.streaming.drain() {
+            if let Some(task) = task {
+                task.wake();
+            }
+        }
         self.clear_pending_capacity(store, counts);
         self.clear_pending_send(store, counts);
         self.clear_pending_open(store, counts);
@@ -617,6 +785,9 @@ impl Send {
         buffer: &mut Buffer<Frame<Bytes>>,
         stream: &mut Ptr,
     ) {
+        self.notify_writer(stream.id);
+        self.streaming.remove(&stream.id);
+        self.flush_pending.remove(&stream.id);
         let span = trace_span!("clear_queue| ", ?stream.id);
         let _e = span.enter();
         while let Some(frame) = stream.pending_send.pop_front(buffer) {
@@ -637,8 +808,7 @@ impl Send {
         {
             trace!("pop pending open| {:?}", stream.id);
             counts.inc_num_send_streams(&mut stream);
-            // TODO(ws)
-            //stream.notify_send();
+            self.notify_writer(stream.id);
             return Some(stream);
         }
         None
@@ -666,11 +836,31 @@ impl Send {
     }
 
     fn set_data_frame_eos(
+        &mut self,
         buffer: &mut Buffer<Frame<Bytes>>,
         stream: &mut Ptr,
         to_ret: &mut frame::Data<Bytes>,
         remaining: Option<frame::Data<Bytes>>,
     ) {
+        if self.streaming.contains_key(&stream.id) {
+            if stream.remaining_data_len.is_none() {
+                if let Some((handed_off, _)) =
+                    self.flush_pending.get_mut(&stream.id)
+                {
+                    *handed_off = true;
+                }
+                self.notify_writer(stream.id);
+                if to_ret.is_end_stream() {
+                    stream.state.send_close();
+                    self.streaming.remove(&stream.id);
+                }
+            } else if let Some(frame) = remaining {
+                stream
+                    .pending_send
+                    .push_front(buffer, frame.into());
+            }
+            return;
+        }
         if stream.remaining_data_len.is_none() {
             trace!("data| completed");
             if stream.pending_send.is_empty() {
@@ -709,7 +899,7 @@ impl Send {
                     .push_front(buffer, frame.into());
                 None
             } else {
-                Self::set_data_frame_eos(buffer, stream, &mut frame, None);
+                self.set_data_frame_eos(buffer, stream, &mut frame, None);
                 Some(frame.into())
             };
         }
@@ -789,7 +979,10 @@ impl Send {
             .payload_mut()
             .split_to(len as usize);
         let mut data_frame = frame::Data::new(stream.id, data);
-        Self::set_data_frame_eos(buffer, stream, &mut data_frame, Some(frame));
+        data_frame.set_end_stream(
+            frame.is_end_stream() && stream.remaining_data_len.is_none(),
+        );
+        self.set_data_frame_eos(buffer, stream, &mut data_frame, Some(frame));
         Some(Frame::Data(data_frame))
     }
 
@@ -844,8 +1037,11 @@ impl Send {
                             );
                             self.try_assign_capacity(&mut stream);
                         }
-                        if stream.is_sending_trailer {
+                        if stream.is_sending_trailer && header.is_end_stream()
+                        {
                             stream.state.send_close();
+                            self.notify_writer(stream.id);
+                            self.streaming.remove(&stream.id);
                         }
                         Frame::Headers(header)
                     }
@@ -899,6 +1095,21 @@ impl Send {
         }
     }
 
+    /// Called only after the codec has successfully flushed its transport.
+    fn notify_flushed(&mut self) {
+        self.flush_pending
+            .retain(|_, (handed_off, task)| {
+                if *handed_off {
+                    if let Some(task) = task.take() {
+                        task.wake();
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+    }
+
     pub fn poll_complete<T>(
         &mut self,
         cx: &mut Context,
@@ -927,6 +1138,7 @@ impl Send {
                 }
                 None => {
                     ready!(dst.flush(cx))?;
+                    self.notify_flushed();
                     return Poll::Ready(Ok(()));
                 }
             }
@@ -1001,5 +1213,103 @@ impl Send {
         if let Some(spa_tracker) = self.spa_tracker.as_mut() {
             spa_tracker.recvd_ping(cx, payload);
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::task::Wake;
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0
+                .fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn sender() -> Send {
+        Send::new(&mut ConnectionConfig {
+            initial_connection_window_size: None,
+            local_max_error_reset_streams: None,
+            local_reset_stream_max: 0,
+            remote_reset_stream_max: 0,
+            reset_stream_duration: std::time::Duration::ZERO,
+            local_settings: frame::Settings::default(),
+            peer_settings: frame::Settings::default(),
+            max_recv_buffer_size: 0,
+            spa_tracker: None,
+        })
+    }
+
+    #[test]
+    fn flush_waits_for_data_and_transport_and_wakes() {
+        let mut send = sender();
+        let id = StreamId::from(1);
+        let mut stream = stream::Stream::new(id, 10, 10);
+        send.start_streaming(id);
+        stream.remaining_data_len = Some(5);
+        send.flush_pending
+            .insert(id, (false, None));
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            send.poll_flush(&stream, &mut cx)
+                .is_pending()
+        );
+        assert_eq!(wakes.0.load(AtomicOrdering::SeqCst), 0);
+        stream.remaining_data_len = None;
+        send.notify_writer(id);
+        assert_eq!(wakes.0.load(AtomicOrdering::SeqCst), 1);
+        send.flush_pending
+            .get_mut(&id)
+            .unwrap()
+            .0 = true;
+        assert!(
+            send.poll_flush(&stream, &mut cx)
+                .is_pending()
+        );
+        send.notify_flushed();
+        assert_eq!(wakes.0.load(AtomicOrdering::SeqCst), 2);
+        assert!(matches!(
+            send.poll_flush(&stream, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn flush_waits_for_empty_end_stream_data() {
+        let mut send = sender();
+        let id = StreamId::from(1);
+        let mut stream = stream::Stream::new(id, 10, 10);
+        send.start_streaming(id);
+        stream.remaining_data_len = Some(0);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(
+            send.poll_flush(&stream, &mut cx)
+                .is_pending()
+        );
+    }
+
+    #[test]
+    fn flush_rejects_reset_even_after_queue_is_cleared() {
+        let mut send = sender();
+        let id = StreamId::from(1);
+        let mut stream = stream::Stream::new(id, 10, 10);
+        stream.set_reset(Reason::CANCEL, Initiator::User);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            send.poll_flush(&stream, &mut cx),
+            Poll::Ready(Err(UserError::InactiveStreamId))
+        ));
     }
 }
