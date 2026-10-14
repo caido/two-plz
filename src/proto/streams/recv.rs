@@ -572,9 +572,11 @@ impl Recv {
         }
 
         let is_pending_send = stream.is_pending_send;
-        stream
-            .state
-            .recv_reset(frame, is_pending_send);
+        stream.state.recv_reset(
+            frame,
+            is_pending_send,
+            counts.role().is_client(),
+        );
         self.move_from_pending_complete(stream, &counts.role());
         stream.notify_recv();
 

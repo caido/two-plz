@@ -6,3 +6,7 @@
 Cargo.lock
 artifacts/
 .DS_Store
+
+.agents/skills
+.claude/
+.cursor/

@@ -52,6 +52,9 @@ use self::Peer::*;
 #[derive(Clone)]
 pub struct State {
     inner: Inner,
+    // RFC 9113 §8.1: canceling an unfinished request with NO_ERROR
+    // must not discard a response whose END_STREAM was already received.
+    recv_completed_before_cancel: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -279,7 +282,12 @@ impl State {
     /// # Arguments
     /// - `frame`: the received RST_STREAM frame.
     /// - `queued`: true if this stream has frames in the pending send queue.
-    pub fn recv_reset(&mut self, frame: frame::Reset, queued: bool) {
+    pub fn recv_reset(
+        &mut self,
+        frame: frame::Reset,
+        queued: bool,
+        is_client: bool,
+    ) {
         match self.inner {
             // If the stream is already in a `Closed` state, do nothing,
             // provided that there are no frames still in the send queue.
@@ -305,6 +313,9 @@ impl State {
                     state,
                     queued
                 );
+                self.recv_completed_before_cancel = is_client
+                    && frame.reason() == Reason::NO_ERROR
+                    && matches!(self.inner, HalfClosedRemote(..));
                 self.inner = Closed(Cause::Error(ProtoError::remote_reset(
                     frame.stream_id(),
                     frame.reason(),
@@ -369,6 +380,7 @@ impl State {
         reason: Reason,
         initiator: Initiator,
     ) {
+        self.recv_completed_before_cancel = false;
         self.inner = Closed(Cause::Error(ProtoError::Reset(
             stream_id, reason, initiator,
         )));
@@ -449,7 +461,11 @@ impl State {
 
     pub fn is_recv_end_stream(&self) -> bool {
         // In either case END_STREAM has been received
-        matches!(self.inner, Closed(Cause::EndStream) | HalfClosedRemote(..))
+        self.recv_completed_before_cancel
+            || matches!(
+                self.inner,
+                Closed(Cause::EndStream) | HalfClosedRemote(..)
+            )
     }
 
     pub fn is_closed(&self) -> bool {
@@ -465,6 +481,9 @@ impl State {
     }
 
     pub fn ensure_recv_open(&self) -> Result<bool, proto::ProtoError> {
+        if self.recv_completed_before_cancel {
+            return Ok(false);
+        }
         // TODO(hyper): Is this correct?
         match self.inner {
             Closed(Cause::Error(ref e)) => Err(e.clone()),
@@ -509,6 +528,7 @@ impl Default for State {
     fn default() -> State {
         State {
             inner: Inner::Idle,
+            recv_completed_before_cancel: false,
         }
     }
 }
@@ -517,5 +537,34 @@ impl Default for State {
 impl fmt::Debug for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_second_reset_preserves_completed_receive() {
+        for reason in [Reason::NO_ERROR, Reason::CANCEL] {
+            let mut state = State {
+                inner: HalfClosedRemote(Streaming),
+                recv_completed_before_cancel: false,
+            };
+            state.recv_reset(
+                frame::Reset::new(StreamId::from(1), Reason::NO_ERROR),
+                false,
+                true,
+            );
+            state.recv_reset(
+                frame::Reset::new(StreamId::from(1), reason),
+                false,
+                true,
+            );
+            assert!(state.is_recv_end_stream());
+            assert!(!state.ensure_recv_open().unwrap());
+            assert!(state.is_remote_reset());
+            assert!(!state.is_send_streaming());
+        }
     }
 }
